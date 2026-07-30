@@ -1,0 +1,40 @@
+{
+  "$schema": "https://schema.tauri.app/config/2",
+  "productName": "slimnotes",
+  "version": "0.1.0",
+  "identifier": "dev.encore.slimnotes",
+  "build": {
+    "beforeDevCommand": { "cwd": "../ui", "script": "trunk serve" },
+    "beforeBuildCommand": { "cwd": "../ui", "script": "trunk build --release" },
+    "devUrl": "http://localhost:1420",
+    "frontendDist": "../ui/dist"
+  },
+  "app": {
+    "withGlobalTauri": true,
+    "windows": [
+      {
+        "label": "main",
+        "title": "slimnotes",
+        "width": 1100,
+        "height": 750,
+        "minWidth": 640,
+        "minHeight": 400
+      }
+    ],
+    "security": {
+      "csp": null
+    }
+  },
+  "bundle": {
+    "active": true,
+    "targets": "all",
+    "icon": [
+      "icons/32x32.png",
+      "icons/128x128.png",
+      "icons/128x128@2x.png",
+      "icons/icon.icns",
+      "icons/icon.ico"
+    ]
+  },
+  "plugins": {}
+}
