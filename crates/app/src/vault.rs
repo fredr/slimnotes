@@ -79,23 +79,6 @@ pub fn write_note(path: &Path, content: &str) -> std::io::Result<()> {
     fs::write(path, content)
 }
 
-/// Create a new empty markdown note under `vault`, avoiding name clashes by
-/// appending a counter. Returns the absolute path of the created file.
-pub fn create_note(vault: &Path, name: &str) -> std::io::Result<PathBuf> {
-    let base = name.trim();
-    let base = if base.is_empty() { "Untitled" } else { base };
-    let base = base.trim_end_matches(".md");
-
-    let mut candidate = vault.join(format!("{base}.md"));
-    let mut n = 1;
-    while candidate.exists() {
-        n += 1;
-        candidate = vault.join(format!("{base} {n}.md"));
-    }
-    fs::write(&candidate, "")?;
-    Ok(candidate)
-}
-
 /// Split markdown into blocks on blank lines, keeping fenced code blocks intact.
 pub fn split_blocks(text: &str) -> Vec<String> {
     let mut blocks: Vec<String> = Vec::new();
