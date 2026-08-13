@@ -5,94 +5,80 @@ at a folder of markdown files and read/edit them with an Obsidian-style **Live
 Preview**: each block renders as markdown, and the block your cursor is in shows
 its raw source.
 
-- **Desktop shell:** [Tauri v2](https://tauri.app) (Rust backend, no JavaScript)
-- **UI:** [Leptos](https://leptos.dev) (CSR, Rust → WASM) rendered in the webview
-- **Vault format:** plain `.md` files in nested folders — the exact same layout
+- **UI:** [GPUI](https://www.gpui.rs/) — Zed's GPU-accelerated Rust UI framework.
+  **No webview, no HTML/JS.** Rendered natively via Blade → Vulkan on Linux.
+- **Widgets:** [gpui-component](https://github.com/longbridge/gpui-component) —
+  its `TextView::markdown` renderer and Rope-backed `InputState` code editor are
+  the two building blocks of the live-preview editor.
+- **Vault format:** plain `.md` files in nested folders — the same layout
   Obsidian uses, so slimnotes and Obsidian can share a vault.
 
 ## Workspace layout
 
 ```
 slimnotes/
-├── flake.nix              # Nix dev shell with all build inputs
+├── flake.nix              # Nix dev shell (Rust + Vulkan/Wayland/X11 libs)
 ├── Cargo.toml             # workspace
 └── crates/
     ├── core/              # shared serde types (Entry, Settings)
-    ├── tauri/             # backend: vault scan + file IO, exposed as commands
-    │   ├── tauri.conf.json
-    │   ├── capabilities/  # Tauri v2 permission ACL
-    │   └── src/main.rs
-    └── ui/                # Leptos frontend
-        ├── index.html     # Trunk entry
-        ├── Trunk.toml
-        ├── styles.css
+    └── app/               # the GPUI binary
         └── src/
-            ├── app.rs     # layout, state, sidebar/tree
-            ├── editor.rs  # live-preview block editor
-            └── api.rs     # typed wrappers over Tauri `invoke`
+            ├── main.rs    # root view: sidebar tree, blocks, click-to-edit
+            └── vault.rs    # std::fs vault access + block split/join
 ```
 
-## Prerequisites (NixOS)
+## Versions
 
-Everything is provided by the flake dev shell — `webkitgtk_4_1`, `gtk3`, the Rust
-toolchain (with the `wasm32-unknown-unknown` target), `trunk`, `wasm-bindgen-cli`
-and `cargo-tauri`. Enter it with:
+Pinned together because they must match:
+
+| Crate | Version | Source |
+|---|---|---|
+| `gpui` | `0.2.2` | crates.io (Apache-2.0) |
+| `gpui-component` | `0.5.1` | crates.io |
+| `gpui-component-assets` | `0.5.1` | crates.io |
+
+## Build & run (NixOS)
+
+The flake dev shell provides the Rust toolchain and the GPUI runtime libraries
+(`vulkan-loader`, `wayland`, `libxkbcommon`, xorg libs, `fontconfig`,
+`freetype`, `libGL`). It also adds `/run/opengl-driver/lib` to
+`LD_LIBRARY_PATH` so Blade finds your GPU's Vulkan driver.
 
 ```sh
 nix develop
+cargo run -p slimnotes
 ```
 
-## Run
+On first run the vault is read from `~/.config/slimnotes/settings.json`
+(`{ "vault": "/abs/path/to/vault" }`). A native folder picker is a planned
+follow-up (see below).
 
-From inside the dev shell:
+## How the live-preview editor works
 
-```sh
-cd crates/tauri
-cargo tauri dev
-```
+A note is split into **blocks** on blank lines (fenced code blocks kept intact).
+Every block is rendered with `TextView::markdown`, except the block you click
+into, which becomes a Rope-backed, syntax-highlighted `InputState` editor showing
+the raw markdown. Edits are written back to the block on `Change`; the file is
+saved on `Blur` and when switching notes.
 
-This starts `trunk serve` (frontend at `http://localhost:1420`) and launches the
-desktop window. On first run click **“Open vault…”** and pick a folder; the
-choice is remembered in `~/.config/dev.encore.slimnotes/settings.json`.
+### Implemented
 
-To build release bundles:
+- Read a vault folder, show the folder/file tree (hidden dirs like `.obsidian`
+  skipped), open notes.
+- Live-preview editing: rendered blocks + click-a-block-to-edit.
+- Auto-save on blur / note switch.
 
-```sh
-cd crates/tauri
-cargo tauri build
-```
+### Planned next steps
 
-### Building the halves separately
+- **Open-vault folder picker** and **New note** button (backend fns
+  `save_settings` / `create_note` already exist in `vault.rs`, just unwired).
+- `Cmd/Ctrl+S`, keyboard nav between blocks.
+- Per-line (rather than per-block) live preview, closer to Obsidian's newest
+  editor.
+- Dark/light theme wiring via gpui-component's theme, rename/delete, search.
 
-```sh
-cd crates/ui && trunk build        # frontend only (WASM)
-cargo build -p slimnotes-tauri     # backend only
-```
+## Notes
 
-> Note: don't run `cargo build` at the workspace root — the `ui` crate targets
-> `wasm32` and is built by Trunk, not by a host-target cargo build.
-
-## The live-preview editor
-
-A note is split into **blocks** on blank lines (fenced code blocks are kept
-intact). Every block is rendered to HTML with
-[`pulldown-cmark`](https://crates.io/crates/pulldown-cmark), except the one block
-you click into, which becomes a `<textarea>` showing the raw markdown. Click
-away (or press `Esc`) and it re-renders. Saving is automatic on blur, plus
-`Ctrl`/`Cmd`+`S`.
-
-### Current limitations / next steps
-
-- Live preview is **block-level**, not per-line as in Obsidian's newest editor.
-  Clicking a multi-line paragraph shows the whole paragraph's source. Moving to
-  a true per-line CodeMirror-style decorator model is the main follow-up.
-- Reassembling blocks normalizes runs of blank lines to a single blank line.
-- No rename/delete/move from the UI yet (do it in the filesystem); no search,
-  wikilinks, tags, or embeds — this is intentionally a small subset of Obsidian.
-
-## Notes for non-NixOS
-
-The flake handles NixOS. On other systems install the
-[Tauri v2 Linux prerequisites](https://tauri.app/start/prerequisites/)
-(`webkit2gtk-4.1`, etc.), plus `trunk` and the `wasm32-unknown-unknown` target,
-then use the same `cargo tauri dev` / `trunk build` commands.
+- GPUI is **pre-1.0**; expect API churn if you bump `gpui`/`gpui-component`.
+- This is intentionally a small subset of Obsidian: no wikilinks, tags, embeds,
+  or graph view.

@@ -1,8 +1,0 @@
-[build]
-target = "index.html"
-
-[serve]
-# Must match `devUrl` in ../tauri/tauri.conf.json.
-address = "127.0.0.1"
-port = 1420
-open = false

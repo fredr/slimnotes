@@ -1,0 +1,16 @@
+[package]
+name = "slimnotes"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+default-run = "slimnotes"
+
+[dependencies]
+slimnotes-core = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+anyhow = { workspace = true }
+gpui = { workspace = true }
+gpui-component = { workspace = true }
+gpui-component-assets = { workspace = true }
+dirs = "6"

@@ -1,5 +1,5 @@
 {
-  description = "slimnotes — a minimal, Obsidian-vault-compatible notes app (Tauri + Leptos)";
+  description = "slimnotes — a minimal, Obsidian-vault-compatible notes app (GPUI)";
 
   inputs = {
     nixpkgs.url = "github:NixOS/nixpkgs/nixos-25.11";
@@ -15,42 +15,38 @@
       let
         overlays = [ (import rust-overlay) ];
         pkgs = import nixpkgs { inherit system overlays; };
+        rust = pkgs.rust-bin.stable.latest.default;
 
-        rust = pkgs.rust-bin.stable.latest.default.override {
-          targets = [ "wasm32-unknown-unknown" ];
-        };
-
-        # Runtime / link libraries required by Tauri's webview on Linux.
+        # GPUI / Blade (Vulkan) runtime + link libraries on Linux. These mirror
+        # the buildInputs nixpkgs uses for the Zed editor, which is built on the
+        # same GPUI stack.
         libraries = with pkgs; [
-          webkitgtk_4_1
-          gtk3
-          cairo
-          gdk-pixbuf
-          glib
-          pango
-          harfbuzz
-          librsvg
-          libsoup_3
+          fontconfig
+          freetype
+          wayland
+          libxkbcommon
+          xorg.libxcb
+          xorg.libX11
+          xorg.libXext
+          libGL
+          vulkan-loader
           openssl
-        ];
-
-        tools = with pkgs; [
-          rust
-          trunk
-          wasm-bindgen-cli
-          cargo-tauri
-          nodejs
+          zlib
         ];
       in
       {
         devShells.default = pkgs.mkShell {
-          nativeBuildInputs = tools ++ (with pkgs; [ pkg-config wrapGAppsHook3 ]);
+          nativeBuildInputs = with pkgs; [ rust pkg-config cmake ];
           buildInputs = libraries;
 
+          # Some -sys crates in the GPUI tree run bindgen.
+          LIBCLANG_PATH = "${pkgs.llvmPackages.libclang.lib}/lib";
+
           shellHook = ''
-            # WebKitGTK + some GPUs need compositing disabled to render at all.
-            export WEBKIT_DISABLE_COMPOSITING_MODE=1
-            echo "slimnotes dev shell — trunk $(trunk --version 2>/dev/null | head -n1), $(cargo-tauri --version 2>/dev/null || cargo tauri --version 2>/dev/null)"
+            # Blade loads Vulkan at runtime; the actual GPU ICD lives in the
+            # NixOS driver path, and libvulkan/wayland come from the store.
+            export LD_LIBRARY_PATH="${pkgs.lib.makeLibraryPath libraries}:/run/opengl-driver/lib:''${LD_LIBRARY_PATH:-}"
+            echo "slimnotes (GPUI) dev shell — rustc $(rustc --version | cut -d' ' -f2)"
           '';
         };
       });
