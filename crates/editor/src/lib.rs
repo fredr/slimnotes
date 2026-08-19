@@ -67,6 +67,10 @@ const QUOTE_INDENT: f32 = 22.0; // left indent per blockquote nesting level (px)
 const UI_FONT: &str = "IBM Plex Sans";
 const MONO_FONT: &str = "IBM Plex Mono";
 
+// Font sizes (px).
+const BODY_FONT: f32 = 18.0; // body text + non-heading lines
+const CODE_FONT: f32 = 16.0; // fenced code blocks + frontmatter
+
 static FONTS_LOADED: std::sync::Once = std::sync::Once::new();
 
 /// Register the bundled IBM Plex faces with the text system, once per process.
@@ -1289,7 +1293,7 @@ impl Element for EditorElement {
             };
 
             let (font_size, base_weight) = if in_block {
-                (px(15.), FontWeight::NORMAL)
+                (px(CODE_FONT), FontWeight::NORMAL)
             } else {
                 heading_style(line)
             };
@@ -1908,7 +1912,7 @@ const CHECKBOX_SLOT: &str = "\u{2003} "; // EM SPACE + space
 
 const TABLE_PAD_X: f32 = 10.0; // horizontal cell padding (px)
 const TABLE_PAD_Y: f32 = 5.0; // vertical cell padding (px)
-const TABLE_FONT: f32 = 15.0; // table cell font size (px)
+const TABLE_FONT: f32 = 16.0; // table cell font size (px)
 const TABLE_BORDER: u32 = 0x3a3a3a; // cell border color
 
 #[derive(Clone, Copy, PartialEq)]
@@ -2137,17 +2141,18 @@ fn heading_style(line: &str) -> (Pixels, FontWeight) {
     let t = line.trim_start();
     let hashes = t.bytes().take_while(|&b| b == b'#').count();
     if (1..=6).contains(&hashes) && t.as_bytes().get(hashes) == Some(&b' ') {
+        // Heading sizes, scaled off the 18px body.
         let (size, weight) = match hashes {
-            1 => (27., FontWeight::BOLD),
-            2 => (21., FontWeight::BOLD),
-            3 => (18., FontWeight::SEMIBOLD),
-            4 => (16.5, FontWeight::SEMIBOLD),
-            5 => (15., FontWeight::SEMIBOLD),
-            _ => (14., FontWeight::SEMIBOLD),
+            1 => (30., FontWeight::BOLD),
+            2 => (25., FontWeight::BOLD),
+            3 => (21., FontWeight::SEMIBOLD),
+            4 => (20., FontWeight::SEMIBOLD),
+            5 => (19., FontWeight::SEMIBOLD),
+            _ => (18., FontWeight::SEMIBOLD),
         };
         (px(size), weight)
     } else {
-        (px(16.), FontWeight::NORMAL)
+        (px(BODY_FONT), FontWeight::NORMAL)
     }
 }
 
