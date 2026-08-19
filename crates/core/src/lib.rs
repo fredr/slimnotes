@@ -2,6 +2,8 @@
 //!
 //! These cross the IPC boundary as JSON, so they only need `serde`.
 
+use std::collections::HashMap;
+
 use serde::{Deserialize, Serialize};
 
 /// A node in the vault file tree: either a folder (with `children`) or a
@@ -21,4 +23,9 @@ pub struct Entry {
 pub struct Settings {
     /// Absolute path to the currently selected Obsidian vault, if any.
     pub vault: Option<String>,
+    /// Per-vault sidebar state: vault path -> the folder paths the user has
+    /// expanded. Folders default to collapsed, so anything not listed here (or
+    /// for a vault with no entry) is shown collapsed.
+    #[serde(default)]
+    pub expanded_folders: HashMap<String, Vec<String>>,
 }

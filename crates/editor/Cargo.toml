@@ -9,3 +9,10 @@ description = "A from-scratch GPUI live-preview markdown editor."
 gpui = { workspace = true }
 pulldown-cmark = { workspace = true }
 image = { workspace = true }
+# Syntax highlighting for fenced code blocks. `default-fancy` uses the pure-Rust
+# fancy-regex engine (no onig/C dependency), bundling the default syntax and
+# theme sets. `two-face` extends that with the bat-curated syntax set (~200
+# languages: TypeScript/TSX, TOML, Nix, Dockerfile, GraphQL, … which syntect's
+# defaults lack); `syntect-fancy` keeps it on the same pure-Rust engine.
+syntect = { version = "5", default-features = false, features = ["default-fancy"] }
+two-face = { version = "0.5.2", default-features = false, features = ["syntect-fancy"] }

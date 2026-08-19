@@ -22,6 +22,15 @@ use slimnotes_editor::{EditorEvent, MarkdownEditor};
 
 const CONTEXT: &str = "SlimNotes";
 
+/// The set of expanded folder paths saved for `vault` (empty if none saved, so
+/// folders start collapsed).
+fn expanded_for(settings: &Settings, vault: Option<&str>) -> HashSet<String> {
+    vault
+        .and_then(|v| settings.expanded_folders.get(v))
+        .map(|f| f.iter().cloned().collect())
+        .unwrap_or_default()
+}
+
 // Save the current note.
 actions!(slimnotes, [Save]);
 
@@ -67,9 +76,13 @@ fn bind_keys(cx: &mut App) {
 
 struct SlimNotes {
     focus_handle: FocusHandle,
+    settings: Settings,
     vault: Option<String>,
     tree: Vec<Entry>,
-    collapsed: HashSet<String>,
+    /// Folder paths the user has expanded in the current vault (folders default
+    /// to collapsed). Mirrors `settings.expanded_folders[vault]` for O(1) lookup
+    /// during tree rendering.
+    expanded: HashSet<String>,
     current: Option<String>,
     editor: Option<Entity<MarkdownEditor>>,
     save_gen: u64,
@@ -78,11 +91,13 @@ struct SlimNotes {
 
 impl SlimNotes {
     fn new(window: &mut Window, cx: &mut Context<Self>) -> Self {
-        let vault = vault::load_settings().vault;
+        let settings = vault::load_settings();
+        let vault = settings.vault.clone();
         let tree = vault
             .as_deref()
             .map(|v| vault::read_tree(Path::new(v)))
             .unwrap_or_default();
+        let expanded = expanded_for(&settings, vault.as_deref());
 
         // Focus the root so keyboard shortcuts work before any block is edited.
         let focus_handle = cx.focus_handle();
@@ -90,9 +105,10 @@ impl SlimNotes {
 
         Self {
             focus_handle,
+            settings,
             vault,
             tree,
-            collapsed: HashSet::new(),
+            expanded,
             current: None,
             editor: None,
             save_gen: 0,
@@ -101,8 +117,15 @@ impl SlimNotes {
     }
 
     fn toggle_folder(&mut self, path: &str, cx: &mut Context<Self>) {
-        if !self.collapsed.remove(path) {
-            self.collapsed.insert(path.to_string());
+        if !self.expanded.remove(path) {
+            self.expanded.insert(path.to_string());
+        }
+        // Persist the new expand/collapse state for this vault.
+        if let Some(vault) = self.vault.clone() {
+            let mut folders: Vec<String> = self.expanded.iter().cloned().collect();
+            folders.sort();
+            self.settings.expanded_folders.insert(vault, folders);
+            vault::save_settings(&self.settings);
         }
         cx.notify();
     }
@@ -147,11 +170,11 @@ impl SlimNotes {
     fn set_vault(&mut self, path: PathBuf, cx: &mut Context<Self>) {
         self.save(cx);
         let path_str = path.to_string_lossy().into_owned();
-        vault::save_settings(&Settings {
-            vault: Some(path_str.clone()),
-        });
+        self.settings.vault = Some(path_str.clone());
+        vault::save_settings(&self.settings);
 
         self.tree = vault::read_tree(&path);
+        self.expanded = expanded_for(&self.settings, Some(&path_str));
         self.vault = Some(path_str);
         self.current = None;
         self.editor = None;
@@ -343,7 +366,7 @@ impl SlimNotes {
         for entry in entries {
             if entry.is_dir {
                 let path = entry.path.clone();
-                let collapsed = self.collapsed.contains(&path);
+                let collapsed = !self.expanded.contains(&path);
                 let chevron = if collapsed { "▸" } else { "▾" };
                 let name = entry.name.clone();
                 out.push(
