@@ -23,3 +23,11 @@ pulldown-cmark = { version = "0.13", default-features = false }
 # Same major as gpui's own image dep, so `image::Frame` is the exact type
 # `RenderImage::new` expects.
 image = "0.25"
+
+# Optimize dependencies even in dev builds. Text shaping (rustybuzz/cosmic-text,
+# via gpui) is ~50x slower unoptimized, which made large notes freeze for seconds
+# on a plain `cargo run`. Our own crates stay at the default dev opt-level so
+# incremental rebuilds stay fast; only third-party deps get optimized (they
+# rarely change, so this cost is paid once).
+[profile.dev.package."*"]
+opt-level = 3

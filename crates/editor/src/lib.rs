@@ -119,6 +119,14 @@ pub struct MarkdownEditor {
     vault_dir: Option<PathBuf>, // vault root, for resolving ![[wikilink]] embeds
     image_cache: HashMap<PathBuf, Option<Arc<RenderImage>>>, // None = failed to load
     vault_index: Option<HashMap<String, PathBuf>>, // lazy basename -> image path map
+    // Perf caches. `text_version` bumps on every text mutation; the parse and the
+    // built layout are reused across frames when their inputs are unchanged, so a
+    // pure scroll or selection change rebuilds nothing (see `prepaint`).
+    text_version: u64,
+    parsed: Option<Rc<ParsedDoc>>,
+    parsed_version: u64,
+    layout_sig: Option<LayoutSig>,
+    shape_cache: HashMap<ShapeKey, WrappedLine>, // persistent shaped lines
 }
 
 impl MarkdownEditor {
@@ -148,7 +156,56 @@ impl MarkdownEditor {
             vault_dir,
             image_cache: HashMap::new(),
             vault_index: None,
+            text_version: 0,
+            parsed: None,
+            parsed_version: 0,
+            layout_sig: None,
+            shape_cache: HashMap::new(),
         }
+    }
+
+    /// Parsed markdown for the current buffer, memoized until the text changes.
+    /// Spans and markers are pre-bucketed per source line so building a line is
+    /// O(line length) rather than O(total spans).
+    fn ensure_parsed(&mut self) -> Rc<ParsedDoc> {
+        if let Some(p) = &self.parsed {
+            if self.parsed_version == self.text_version {
+                return p.clone();
+            }
+        }
+        let (spans, markers, links) = parse(&self.text);
+        let code = classify_code(&self.text);
+        let fm_end = frontmatter_end(&self.text);
+
+        let n = code.len().max(1); // classify_code yields one entry per source line
+        let mut line_spans: Vec<Vec<Span>> = vec![Vec::new(); n];
+        let mut line_markers: Vec<Vec<(usize, usize)>> = vec![Vec::new(); n];
+        let mut off = 0usize;
+        for (li, line) in self.text.split('\n').enumerate() {
+            let (ls, le) = (off, off + line.len());
+            for s in &spans {
+                if s.start < le && s.end > ls {
+                    line_spans[li].push(s.clone());
+                }
+            }
+            for &m in &markers {
+                if m.1 > ls && m.0 < le {
+                    line_markers[li].push(m);
+                }
+            }
+            off = le + 1; // + newline
+        }
+
+        let doc = Rc::new(ParsedDoc {
+            links,
+            code,
+            fm_end,
+            line_spans,
+            line_markers,
+        });
+        self.parsed = Some(doc.clone());
+        self.parsed_version = self.text_version;
+        doc
     }
 
     pub fn text(&self) -> &str {
@@ -179,6 +236,9 @@ impl MarkdownEditor {
         self.scroll_top = px(0.);
         self.scroll_to_caret = true;
         self.layout = None;
+        self.layout_sig = None;
+        self.shape_cache.clear();
+        self.text_version = self.text_version.wrapping_add(1);
         self.undo_stack.clear();
         self.redo_stack.clear();
         self.last_coalesce = None;
@@ -242,6 +302,7 @@ impl MarkdownEditor {
         self.text = s.text;
         self.cursor = s.cursor;
         self.anchor = s.anchor;
+        self.text_version = self.text_version.wrapping_add(1);
     }
 
     fn record(&mut self, coalesce: Option<u8>) {
@@ -281,6 +342,7 @@ impl MarkdownEditor {
             self.text.replace_range(sel.clone(), "");
             self.cursor = sel.start;
             self.anchor = None;
+            self.text_version = self.text_version.wrapping_add(1);
             true
         } else {
             false
@@ -294,6 +356,7 @@ impl MarkdownEditor {
         self.text.insert_str(self.cursor, s);
         self.cursor += s.len();
         self.anchor = None;
+        self.text_version = self.text_version.wrapping_add(1);
     }
 
     fn backspace(&mut self) {
@@ -307,6 +370,7 @@ impl MarkdownEditor {
         let prev = prev_boundary(&self.text, self.cursor);
         self.text.replace_range(prev..self.cursor, "");
         self.cursor = prev;
+        self.text_version = self.text_version.wrapping_add(1);
     }
 
     // ---- clipboard ----
@@ -324,6 +388,7 @@ impl MarkdownEditor {
             self.text.replace_range(sel.clone(), "");
             self.cursor = sel.start;
             self.anchor = None;
+            self.text_version = self.text_version.wrapping_add(1);
         }
     }
 
@@ -339,6 +404,7 @@ impl MarkdownEditor {
         self.text.insert_str(self.cursor, &s);
         self.cursor += s.len();
         self.anchor = None;
+        self.text_version = self.text_version.wrapping_add(1);
     }
 
     fn select_all(&mut self) {
@@ -418,6 +484,7 @@ impl MarkdownEditor {
         self.record(None);
         self.text.replace_range(inner_abs..inner_abs + 1, repl);
         self.last_coalesce = None;
+        self.text_version = self.text_version.wrapping_add(1);
     }
 
     fn on_key(&mut self, ev: &KeyDownEvent, _window: &mut Window, cx: &mut Context<Self>) {
@@ -645,6 +712,98 @@ struct EditorElement {
     editor: Entity<MarkdownEditor>,
 }
 
+/// Memoized parse of the whole buffer (see [`MarkdownEditor::ensure_parsed`]).
+/// `line_spans`/`line_markers` bucket the global spans/markers by the source line
+/// they touch, so per-line building doesn't scan every span.
+struct ParsedDoc {
+    links: Links,
+    code: Vec<CodeLine>,
+    fm_end: Option<usize>,
+    line_spans: Vec<Vec<Span>>,
+    line_markers: Vec<Vec<(usize, usize)>>,
+}
+
+/// The inputs a built [`Layout`] depends on. When these are unchanged between
+/// frames (a pure scroll, or a selection change) the layout is reused as-is.
+#[derive(Clone, Copy, PartialEq, Eq)]
+struct LayoutSig {
+    version: u64,   // text_version
+    width: u32,     // wrap width, f32 bits
+    cursor_line: usize,
+    cursor_col: usize, // line-local; drives the caret-line reveal (e.g. checkbox)
+}
+
+/// Cache key for a shaped line. A `WrappedLine` is fully determined by its
+/// display text, font size, wrap width and runs (the runs also bake in colors /
+/// decorations, so those are folded into `runs`). Same key → identical shaping.
+#[derive(Clone, PartialEq, Eq, Hash)]
+struct ShapeKey {
+    text: SharedString,
+    font_size: u32, // f32 bits
+    width: u32,     // f32 bits (already clamped)
+    runs: u64,      // digest of the TextRun list
+}
+
+/// A digest of a run list covering everything that affects the shaped output:
+/// geometry (font, size implied by key, length) and decoration (color, bg,
+/// underline/strikethrough presence).
+fn runs_digest(runs: &[TextRun]) -> u64 {
+    use std::hash::{Hash, Hasher};
+    let mut h = std::collections::hash_map::DefaultHasher::new();
+    for r in runs {
+        r.len.hash(&mut h);
+        r.font.hash(&mut h);
+        [r.color.h, r.color.s, r.color.l, r.color.a].map(f32::to_bits).hash(&mut h);
+        match &r.background_color {
+            Some(c) => {
+                1u8.hash(&mut h);
+                [c.h, c.s, c.l, c.a].map(f32::to_bits).hash(&mut h);
+            }
+            None => 0u8.hash(&mut h),
+        }
+        r.underline.is_some().hash(&mut h);
+        r.strikethrough.is_some().hash(&mut h);
+    }
+    h.finish()
+}
+
+/// Shape one display line, reusing a previously shaped `WrappedLine` when the
+/// same (text, size, width, runs) was shaped before. Hits move from `old` into
+/// `new`; whatever stays in `old` at the end of a build is dropped, bounding the
+/// cache to the lines actually used this frame.
+#[allow(clippy::too_many_arguments)]
+fn shape_cached(
+    old: &mut HashMap<ShapeKey, WrappedLine>,
+    new: &mut HashMap<ShapeKey, WrappedLine>,
+    window: &mut Window,
+    display: &SharedString,
+    font_size: Pixels,
+    runs: &[TextRun],
+    width: Pixels,
+) -> WrappedLine {
+    let shape_width = width.max(px(40.));
+    let key = ShapeKey {
+        text: display.clone(),
+        font_size: f32::from(font_size).to_bits(),
+        width: f32::from(shape_width).to_bits(),
+        runs: runs_digest(runs),
+    };
+    let wrapped = old
+        .remove(&key)
+        .or_else(|| new.get(&key).cloned())
+        .unwrap_or_else(|| {
+            window
+                .text_system()
+                .shape_text(display.clone(), font_size, runs, Some(shape_width), None)
+                .expect("shape_text")
+                .into_iter()
+                .next()
+                .expect("one wrapped line")
+        });
+    new.insert(key, wrapped.clone());
+    wrapped
+}
+
 struct Prepaint {
     layout: Rc<Layout>,
     scroll_top: Pixels,
@@ -656,6 +815,44 @@ impl IntoElement for EditorElement {
     type Element = Self;
     fn into_element(self) -> Self::Element {
         self
+    }
+}
+
+impl EditorElement {
+    /// Finish a prepaint: clamp scroll (keeping the caret in view), persist it,
+    /// and package the state for `paint`. Shared by the cache-hit and rebuild
+    /// paths so both handle scrolling identically.
+    fn finish(
+        &mut self,
+        layout: Rc<Layout>,
+        mut scroll_top: Pixels,
+        scroll_to_caret: bool,
+        cursor: usize,
+        selection: Option<(usize, usize)>,
+        viewport_height: Pixels,
+        cx: &mut App,
+    ) -> Prepaint {
+        if scroll_to_caret {
+            if let Some((_, cy, lh)) = layout.caret(cursor) {
+                if cy < scroll_top {
+                    scroll_top = cy;
+                } else if cy + lh > scroll_top + viewport_height {
+                    scroll_top = cy + lh - viewport_height;
+                }
+            }
+        }
+        let max_scroll = (layout.total_height - viewport_height).max(px(0.));
+        scroll_top = scroll_top.clamp(px(0.), max_scroll);
+        self.editor.update(cx, |e, _| {
+            e.scroll_top = scroll_top;
+            e.scroll_to_caret = false;
+        });
+        Prepaint {
+            layout,
+            scroll_top,
+            cursor,
+            selection,
+        }
     }
 }
 
@@ -693,36 +890,53 @@ impl Element for EditorElement {
         window: &mut Window,
         cx: &mut App,
     ) -> Prepaint {
-        let (text, cursor, selection, mut scroll_top, scroll_to_caret) = {
+        let (cursor, selection, scroll_top, scroll_to_caret, version) = {
             let e = self.editor.read(cx);
             (
-                e.text.clone(),
                 e.cursor,
                 e.selection().map(|r| (r.start, r.end)),
                 e.scroll_top,
                 e.scroll_to_caret,
+                e.text_version,
             )
         };
+        let wrap_width = bounds.size.width.max(px(80.));
+        let viewport_height = bounds.size.height;
+        let (cursor_line, cursor_col) = {
+            let e = self.editor.read(cx);
+            offset_to_line_col(&e.text, cursor)
+        };
+        let sig = LayoutSig {
+            version,
+            width: f32::from(wrap_width).to_bits(),
+            cursor_line,
+            cursor_col,
+        };
 
+        // Fast path: when the layout's inputs are unchanged (a pure scroll or a
+        // selection change) reuse the last one, instead of re-parsing and
+        // re-shaping every line. This is what keeps scrolling large notes smooth.
+        let cached = self
+            .editor
+            .update(cx, |e, _| (e.layout_sig == Some(sig)).then(|| e.layout.clone()).flatten());
+        if let Some(layout) = cached {
+            return self.finish(layout, scroll_top, scroll_to_caret, cursor, selection, viewport_height, cx);
+        }
+
+        // Slow path: (re)build the layout from a memoized parse. Shaped lines are
+        // served from a persistent cache (`shape_cache`) so a rebuild only shapes
+        // the lines whose text/style actually changed — the rest are reused even
+        // across the fast-path frames that would otherwise evict GPUI's own cache.
+        let text = self.editor.read(cx).text.clone();
+        let parsed = self.editor.update(cx, |e, _| e.ensure_parsed());
+        let mut old_shapes = self.editor.update(cx, |e, _| std::mem::take(&mut e.shape_cache));
+        let mut new_shapes: HashMap<ShapeKey, WrappedLine> = HashMap::new();
         let mut base_font = window.text_style().font();
         base_font.family = UI_FONT.into();
         let mut mono_font = base_font.clone();
         mono_font.family = MONO_FONT.into();
-        let (spans, markers, links) = parse(&text);
-        let (cursor_line, _) = offset_to_line_col(&text, cursor);
-        let wrap_width = bounds.size.width.max(px(80.));
-        let code = classify_code(&text);
-        // YAML frontmatter: a `---` fence at the very top. Shown de-emphasized as
-        // a metadata panel (reusing the code-block presentation).
-        let fm_end: Option<usize> = if text.split('\n').next().map(str::trim) == Some("---") {
-            text.split('\n')
-                .enumerate()
-                .skip(1)
-                .find(|(_, l)| l.trim() == "---")
-                .map(|(i, _)| i)
-        } else {
-            None
-        };
+        let code = &parsed.code;
+        let fm_end = parsed.fm_end;
 
         // Pre-shape rendered tables (blocks not containing the caret): measure
         // columns, then lay out each row's cells.
@@ -853,7 +1067,7 @@ impl Element for EditorElement {
             let lh = line_height(font_size);
             let font = if in_block { &mono_font } else { &base_font };
             // Hide a ``` fence line unless the caret is inside that same block.
-            let hide_fence = fence_hidden(&code, cursor_line, li);
+            let hide_fence = fence_hidden(code, cursor_line, li);
             // A horizontal rule (unless the caret is on it, so it stays editable).
             let hr = !is_cursor_line && !in_block && is_hr(line);
             // Blockquote: concealed `>` prefix + inset + left bar, unless editing.
@@ -870,7 +1084,7 @@ impl Element for EditorElement {
             } else if in_block {
                 Vec::new()
             } else {
-                let mut v = line_ops(line, offset, &markers, cursor_col);
+                let mut v = line_ops(line, offset, &parsed.line_markers[li], cursor_col);
                 if let Some((_, plen)) = quoted {
                     v.insert(0, Op { src: 0..plen, repl: Repl::Hide });
                     v.sort_by_key(|o| o.src.start);
@@ -884,7 +1098,7 @@ impl Element for EditorElement {
             // On the caret's line the markers are shown raw; dim them (like the
             // gray `#` of a heading in Obsidian).
             let dim = if is_cursor_line && !in_block {
-                let mut d = dim_ranges(line, offset, &markers);
+                let mut d = dim_ranges(line, offset, &parsed.line_markers[li]);
                 if let Some((_, plen)) = quote {
                     d.push((0, plen)); // dim the `>` on the line being edited
                 }
@@ -893,18 +1107,17 @@ impl Element for EditorElement {
                 Vec::new()
             };
             let (display, runs, segs, checks) =
-                build_line(line, offset, &ops, &spans, font, &dim, base_weight, checked);
+                build_line(line, offset, &ops, &parsed.line_spans[li], font, &dim, base_weight, checked);
             let display = SharedString::from(display);
-            let shape = |width: Pixels, window: &mut Window| {
-                window
-                    .text_system()
-                    .shape_text(display.clone(), font_size, &runs, Some(width.max(px(40.))), None)
-                    .expect("shape_text")
-                    .into_iter()
-                    .next()
-                    .expect("one wrapped line")
-            };
-            let mut wrapped = shape(wrap_width, window);
+            let mut wrapped = shape_cached(
+                &mut old_shapes,
+                &mut new_shapes,
+                window,
+                &display,
+                font_size,
+                &runs,
+                wrap_width,
+            );
 
             // Hanging indent for wrapped list items: align continuation rows
             // under the text (after the bullet/checkbox), not the marker. Source
@@ -924,7 +1137,15 @@ impl Element for EditorElement {
                 hang = wrapped.position_for_index(disp, lh).map(|p| p.x).unwrap_or_default();
                 // Re-shape narrower so shifted continuation rows don't overflow.
                 if hang > px(0.) && wrapped.size(lh).height > lh {
-                    wrapped = shape(wrap_width - hang, window);
+                    wrapped = shape_cached(
+                        &mut old_shapes,
+                        &mut new_shapes,
+                        window,
+                        &display,
+                        font_size,
+                        &runs,
+                        wrap_width - hang,
+                    );
                 }
             }
 
@@ -963,39 +1184,18 @@ impl Element for EditorElement {
         }
 
         let total_height = top;
-        let viewport_height = bounds.size.height;
         let layout = Rc::new(Layout {
             lines,
             total_height,
             viewport_height,
-            links,
+            links: parsed.links.clone(),
         });
-
-        // Keep the caret in view.
-        if scroll_to_caret {
-            if let Some((_, cy, lh)) = layout.caret(cursor) {
-                if cy < scroll_top {
-                    scroll_top = cy;
-                } else if cy + lh > scroll_top + viewport_height {
-                    scroll_top = cy + lh - viewport_height;
-                }
-            }
-        }
-        let max_scroll = (total_height - viewport_height).max(px(0.));
-        scroll_top = scroll_top.clamp(px(0.), max_scroll);
-
         self.editor.update(cx, |e, _| {
             e.layout = Some(layout.clone());
-            e.scroll_top = scroll_top;
-            e.scroll_to_caret = false;
+            e.layout_sig = Some(sig);
+            e.shape_cache = new_shapes;
         });
-
-        Prepaint {
-            layout,
-            scroll_top,
-            cursor,
-            selection,
-        }
+        self.finish(layout, scroll_top, scroll_to_caret, cursor, selection, viewport_height, cx)
     }
 
     fn paint(
@@ -1341,6 +1541,7 @@ enum Attr {
     Tag,
 }
 
+#[derive(Clone)]
 struct Span {
     start: usize,
     end: usize,
@@ -2013,6 +2214,19 @@ fn table_aligns(sep: &str) -> Vec<TableAlign> {
         .collect()
 }
 
+/// The line index of the closing `---` of YAML frontmatter (a `---` fence on the
+/// very first line), if present. Those lines render as a de-emphasized panel.
+fn frontmatter_end(text: &str) -> Option<usize> {
+    if text.split('\n').next().map(str::trim) != Some("---") {
+        return None;
+    }
+    text.split('\n')
+        .enumerate()
+        .skip(1)
+        .find(|(_, l)| l.trim() == "---")
+        .map(|(i, _)| i)
+}
+
 fn classify_code(text: &str) -> Vec<CodeLine> {
     let mut out = Vec::new();
     let mut inside = false;
@@ -2371,6 +2585,42 @@ mod tests {
         assert!(runs.iter().find(|r| r.0 == "wow").unwrap().3, "highlight bg");
         // The #tag keeps its `#` and gets a background too.
         assert!(runs.iter().find(|r| r.0 == "#tag").unwrap().3, "tag bg");
+    }
+
+    #[test]
+    fn per_line_span_bucketing_matches_global() {
+        // The perf refactor buckets spans/markers per source line before building.
+        // That must be indistinguishable from scanning the global sets, for every
+        // line — otherwise concealment/styling would silently differ.
+        let text =
+            "**bold** and *it*\nplain `code` here\n# Heading\n- [x] a ==hi== #tag\n> quote **b**";
+        let (spans, markers, _l) = parse(text);
+        let base = test_font();
+        let mut off = 0usize;
+        for line in text.split('\n') {
+            let (ls, le) = (off, off + line.len());
+            let fspans: Vec<Span> =
+                spans.iter().filter(|s| s.start < le && s.end > ls).cloned().collect();
+            let fmarks: Vec<(usize, usize)> =
+                markers.iter().copied().filter(|m| m.1 > ls && m.0 < le).collect();
+
+            let ops_g = line_ops(line, off, &markers, None);
+            let ops_f = line_ops(line, off, &fmarks, None);
+            let (dg, rg, _, _) =
+                build_line(line, off, &ops_g, &spans, &base, &[], FontWeight::NORMAL, false);
+            let (df, rf, _, _) =
+                build_line(line, off, &ops_f, &fspans, &base, &[], FontWeight::NORMAL, false);
+
+            assert_eq!(dg, df, "display differs for {line:?}");
+            assert_eq!(rg.len(), rf.len(), "run count differs for {line:?}");
+            for (a, b) in rg.iter().zip(rf.iter()) {
+                assert_eq!(a.len, b.len);
+                assert_eq!(a.font.weight, b.font.weight);
+                assert_eq!(a.font.style, b.font.style);
+                assert_eq!(a.background_color.is_some(), b.background_color.is_some());
+            }
+            off = le + 1;
+        }
     }
 
     #[test]
