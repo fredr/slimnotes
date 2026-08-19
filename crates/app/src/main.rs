@@ -1,10 +1,10 @@
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
-mod markdown;
 mod vault;
 
 use std::collections::HashSet;
 use std::path::{Path, PathBuf};
+use std::time::Duration;
 
 use gpui::{
     actions, div, px, size, AnyElement, App, AppContext, Application, Context, Entity, FocusHandle,
@@ -14,16 +14,16 @@ use gpui::{
 };
 use gpui_component::{
     button::{Button, ButtonVariants},
-    input::{Input, InputEvent, InputState},
     h_flex, v_flex, ActiveTheme, Disableable, IconName, Root, Sizable, Theme, ThemeMode,
 };
 use gpui_component_assets::Assets;
 use slimnotes_core::{Entry, Settings};
+use slimnotes_editor::{EditorEvent, MarkdownEditor};
 
 const CONTEXT: &str = "SlimNotes";
 
-// Save the current note; exit edit mode; move edit focus between blocks.
-actions!(slimnotes, [Save, ExitEdit, NextBlock, PrevBlock]);
+// Save the current note.
+actions!(slimnotes, [Save]);
 
 /// Override gpui-component's default dark palette (near-black / near-white,
 /// high contrast) with a softer, Obsidian-like dark scheme.
@@ -62,10 +62,6 @@ fn bind_keys(cx: &mut App) {
         KeyBinding::new("cmd-s", Save, Some(CONTEXT)),
         #[cfg(not(target_os = "macos"))]
         KeyBinding::new("ctrl-s", Save, Some(CONTEXT)),
-        KeyBinding::new("escape", ExitEdit, Some(CONTEXT)),
-        // Alt (not Ctrl) to avoid clashing with the editor's own cursor keys.
-        KeyBinding::new("alt-down", NextBlock, Some(CONTEXT)),
-        KeyBinding::new("alt-up", PrevBlock, Some(CONTEXT)),
     ]);
 }
 
@@ -75,10 +71,9 @@ struct SlimNotes {
     tree: Vec<Entry>,
     collapsed: HashSet<String>,
     current: Option<String>,
-    blocks: Vec<String>,
-    active: Option<usize>,
-    editor: Option<Entity<InputState>>,
-    _subs: Vec<Subscription>,
+    editor: Option<Entity<MarkdownEditor>>,
+    save_gen: u64,
+    _editor_sub: Option<Subscription>,
 }
 
 impl SlimNotes {
@@ -99,10 +94,9 @@ impl SlimNotes {
             tree,
             collapsed: HashSet::new(),
             current: None,
-            blocks: Vec::new(),
-            active: None,
             editor: None,
-            _subs: Vec::new(),
+            save_gen: 0,
+            _editor_sub: None,
         }
     }
 
@@ -151,7 +145,7 @@ impl SlimNotes {
     }
 
     fn set_vault(&mut self, path: PathBuf, cx: &mut Context<Self>) {
-        self.save();
+        self.save(cx);
         let path_str = path.to_string_lossy().into_owned();
         vault::save_settings(&Settings {
             vault: Some(path_str.clone()),
@@ -160,10 +154,8 @@ impl SlimNotes {
         self.tree = vault::read_tree(&path);
         self.vault = Some(path_str);
         self.current = None;
-        self.blocks.clear();
-        self.active = None;
         self.editor = None;
-        self._subs.clear();
+        self._editor_sub = None;
         cx.notify();
     }
 
@@ -202,121 +194,62 @@ impl SlimNotes {
         self.open_note(&path.to_string_lossy(), window, cx);
     }
 
-    fn save(&self) {
-        if let Some(path) = &self.current {
-            let content = vault::join_blocks(&self.blocks);
+    fn save(&self, cx: &App) {
+        if let (Some(path), Some(editor)) = (&self.current, &self.editor) {
+            let content = editor.read(cx).text().to_string();
             let _ = vault::write_note(Path::new(path), &content);
         }
     }
 
+    /// Debounced autosave: write ~400ms after the last edit.
+    fn schedule_save(&mut self, cx: &mut Context<Self>) {
+        self.save_gen = self.save_gen.wrapping_add(1);
+        let generation = self.save_gen;
+        cx.spawn(async move |this, cx| {
+            cx.background_executor()
+                .timer(Duration::from_millis(400))
+                .await;
+            let _ = this.update(cx, |this, cx| {
+                if this.save_gen == generation {
+                    this.save(cx);
+                }
+            });
+        })
+        .detach();
+    }
+
     fn open_note(&mut self, path: &str, window: &mut Window, cx: &mut Context<Self>) {
-        self.save();
+        self.save(cx);
         if let Ok(content) = vault::read_note(Path::new(path)) {
-            self.blocks = vault::split_blocks(&content);
+            let base_dir = Path::new(path).parent().map(|p| p.to_path_buf());
+            let vault_dir = self.vault.as_ref().map(PathBuf::from);
+            let editor =
+                cx.new(|cx| MarkdownEditor::new(content, base_dir, vault_dir, window, cx));
+            let sub = cx.subscribe_in(
+                &editor,
+                window,
+                |this, _editor, event: &EditorEvent, window, cx| match event {
+                    EditorEvent::Changed => this.schedule_save(cx),
+                    EditorEvent::OpenNote(name) => this.open_note_by_name(name, window, cx),
+                },
+            );
+            self.editor = Some(editor);
+            self._editor_sub = Some(sub);
             self.current = Some(path.to_string());
-            self.active = None;
-            self.editor = None;
-            self._subs.clear();
-            self.focus_handle.focus(window);
             cx.notify();
         }
     }
 
-    /// Pull the live editor text into the active block (belt-and-suspenders;
-    /// `InputEvent::Change` already keeps it in sync).
-    fn flush_active(&mut self, cx: &App) {
-        if let (Some(i), Some(editor)) = (self.active, self.editor.as_ref()) {
-            let value = editor.read(cx).value().to_string();
-            if let Some(block) = self.blocks.get_mut(i) {
-                *block = value;
-            }
+    /// Open a note by its `[[wikilink]]` name, resolved across the vault.
+    fn open_note_by_name(&mut self, name: &str, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(vault) = self.vault.clone() else { return };
+        if let Some(path) = vault::resolve_note(Path::new(&vault), name) {
+            self.open_note(&path.to_string_lossy(), window, cx);
         }
     }
 
     fn on_save(&mut self, _: &Save, _window: &mut Window, cx: &mut Context<Self>) {
-        self.flush_active(cx);
-        self.save();
-    }
-
-    fn on_exit_edit(&mut self, _: &ExitEdit, window: &mut Window, cx: &mut Context<Self>) {
-        if self.active.is_none() {
-            return;
-        }
-        self.flush_active(cx);
-        self.save();
-        self.active = None;
-        self.editor = None;
-        self._subs.clear();
-        self.focus_handle.focus(window);
-        cx.notify();
-    }
-
-    fn on_next_block(&mut self, _: &NextBlock, window: &mut Window, cx: &mut Context<Self>) {
-        if self.current.is_none() {
-            return;
-        }
-        self.flush_active(cx);
-        let target = match self.active {
-            Some(i) if i + 1 < self.blocks.len() => i + 1,
-            Some(i) => {
-                // At the last block: append a fresh one to keep writing.
-                self.blocks.push(String::new());
-                i + 1
-            }
-            None if !self.blocks.is_empty() => 0,
-            None => return,
-        };
-        self.activate_block(target, window, cx);
-    }
-
-    fn on_prev_block(&mut self, _: &PrevBlock, window: &mut Window, cx: &mut Context<Self>) {
-        if self.current.is_none() {
-            return;
-        }
-        self.flush_active(cx);
-        let target = match self.active {
-            Some(i) if i > 0 => i - 1,
-            Some(_) => return,
-            None if !self.blocks.is_empty() => self.blocks.len() - 1,
-            None => return,
-        };
-        self.activate_block(target, window, cx);
-    }
-
-    fn activate_block(&mut self, index: usize, window: &mut Window, cx: &mut Context<Self>) {
-        self.save();
-        let content = self.blocks.get(index).cloned().unwrap_or_default();
-
-        let editor = cx.new(|cx| {
-            InputState::new(window, cx)
-                .code_editor("markdown")
-                .auto_grow(1, 60)
-                .default_value(content)
-        });
-
-        let sub = cx.subscribe_in(
-            &editor,
-            window,
-            move |this, state, ev: &InputEvent, _window, cx| match ev {
-                InputEvent::Change => {
-                    let value = state.read(cx).value().to_string();
-                    if let Some(i) = this.active {
-                        if let Some(block) = this.blocks.get_mut(i) {
-                            *block = value;
-                        }
-                    }
-                }
-                InputEvent::Blur => this.save(),
-                _ => {}
-            },
-        );
-
-        editor.update(cx, |state, cx| state.focus(window, cx));
-
-        self.editor = Some(editor);
-        self._subs = vec![sub];
-        self.active = Some(index);
-        cx.notify();
+        self.save(cx);
     }
 
     fn render_sidebar(&self, cx: &mut Context<Self>) -> impl IntoElement {
@@ -473,8 +406,9 @@ impl SlimNotes {
 
     fn render_content(&self, cx: &mut Context<Self>) -> AnyElement {
         let muted = cx.theme().muted_foreground;
+        let border = cx.theme().border;
 
-        if self.current.is_none() {
+        let Some(editor) = &self.editor else {
             let message = if self.vault.is_none() {
                 "Open a vault to get started."
             } else {
@@ -488,43 +422,7 @@ impl SlimNotes {
                 .text_color(muted)
                 .child(SharedString::from(message))
                 .into_any_element();
-        }
-
-        let border = cx.theme().border;
-        let block_hover = cx.theme().muted.alpha(0.35);
-        let breadcrumb = self.breadcrumb();
-        let md_style = markdown::MdStyle {
-            text: cx.theme().foreground,
-            muted: cx.theme().muted_foreground,
-            code_bg: cx.theme().secondary,
-            code_fg: cx.theme().foreground,
-            link: cx.theme().primary,
-            border: cx.theme().border,
         };
-
-        let mut items: Vec<AnyElement> = Vec::new();
-        for (i, block) in self.blocks.iter().enumerate() {
-            if self.active == Some(i) {
-                if let Some(editor) = &self.editor {
-                    items.push(Input::new(editor).into_any_element());
-                    continue;
-                }
-            }
-
-            let row = div()
-                .id(SharedString::from(format!("block-{i}")))
-                .px_2()
-                .py(px(2.))
-                .min_h(px(26.))
-                .rounded(px(4.))
-                .cursor_pointer()
-                .hover(move |s| s.bg(block_hover))
-                .child(markdown::render_markdown(block, md_style))
-                .on_click(cx.listener(move |this, _, window, cx| {
-                    this.activate_block(i, window, cx);
-                }));
-            items.push(row.into_any_element());
-        }
 
         v_flex()
             .flex_1()
@@ -540,27 +438,15 @@ impl SlimNotes {
                     .border_color(border)
                     .text_size(px(13.))
                     .text_color(muted)
-                    .child(SharedString::from(breadcrumb)),
+                    .child(SharedString::from(self.breadcrumb())),
             )
             .child(
+                // The editor manages its own scrolling; clip it to this pane.
                 div()
-                    .id(SharedString::from("content-scroll"))
                     .flex_1()
-                    .overflow_y_scroll()
-                    .child(
-                        v_flex()
-                            .w_full()
-                            .items_center()
-                            .px(px(40.))
-                            .py(px(28.))
-                            .child(
-                                v_flex()
-                                    .w_full()
-                                    .max_w(px(720.))
-                                    .gap(px(2.))
-                                    .children(items),
-                            ),
-                    ),
+                    .min_h(px(0.))
+                    .overflow_hidden()
+                    .child(editor.clone()),
             )
             .into_any_element()
     }
@@ -574,9 +460,6 @@ impl Render for SlimNotes {
             .key_context(CONTEXT)
             .track_focus(&self.focus_handle)
             .on_action(cx.listener(Self::on_save))
-            .on_action(cx.listener(Self::on_exit_edit))
-            .on_action(cx.listener(Self::on_next_block))
-            .on_action(cx.listener(Self::on_prev_block))
             .size_full()
             .bg(bg)
             .text_color(fg)

@@ -1,10 +1,10 @@
 [workspace]
-resolver = "2"
-members = ["crates/core", "crates/app"]
+resolver = "3"
+members = ["crates/core", "crates/editor", "crates/app"]
 
 [workspace.package]
 version = "0.1.0"
-edition = "2021"
+edition = "2024"
 license = "MIT"
 
 [workspace.dependencies]
@@ -12,10 +12,14 @@ serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 anyhow = "1"
 slimnotes-core = { path = "crates/core" }
+slimnotes-editor = { path = "crates/editor" }
 
 # GPUI (Zed's UI framework) + the gpui-component widget library. gpui-component
 # 0.5.1 depends on the crates.io gpui 0.2.2, so both are pinned together.
 gpui = "0.2.2"
 gpui-component = "0.5.1"
 gpui-component-assets = "0.5.1"
-pulldown-cmark = { version = "0.12", default-features = false }
+pulldown-cmark = { version = "0.13", default-features = false }
+# Same major as gpui's own image dep, so `image::Frame` is the exact type
+# `RenderImage::new` expects.
+image = "0.25"

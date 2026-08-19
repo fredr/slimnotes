@@ -71,6 +71,50 @@ fn read_dir_entries(dir: &Path) -> std::io::Result<Vec<Entry>> {
     Ok(dirs)
 }
 
+/// Resolve an Obsidian `[[wikilink]]` name to a note path. Tries the vault-root
+/// relative path first, then matches by basename anywhere in the vault (shortest
+/// path wins), mirroring Obsidian's link resolution.
+pub fn resolve_note(vault: &Path, name: &str) -> Option<PathBuf> {
+    let want = name.trim().trim_end_matches(".md");
+    if want.is_empty() {
+        return None;
+    }
+    let direct = vault.join(format!("{want}.md"));
+    if direct.is_file() {
+        return Some(direct);
+    }
+    let want_base = want.rsplit(['/', '\\']).next().unwrap_or(want).to_lowercase();
+    let mut best: Option<PathBuf> = None;
+    let mut stack = vec![vault.to_path_buf()];
+    while let Some(dir) = stack.pop() {
+        let Ok(rd) = fs::read_dir(&dir) else { continue };
+        for entry in rd.flatten() {
+            let fname = entry.file_name().to_string_lossy().into_owned();
+            if fname.starts_with('.') {
+                continue;
+            }
+            let path = entry.path();
+            if path.is_dir() {
+                stack.push(path);
+            } else if path.extension().and_then(|e| e.to_str()) == Some("md") {
+                let stem = path
+                    .file_stem()
+                    .and_then(|s| s.to_str())
+                    .unwrap_or("")
+                    .to_lowercase();
+                if stem == want_base
+                    && best
+                        .as_ref()
+                        .is_none_or(|b| path.components().count() < b.components().count())
+                {
+                    best = Some(path);
+                }
+            }
+        }
+    }
+    best
+}
+
 pub fn read_note(path: &Path) -> std::io::Result<String> {
     fs::read_to_string(path)
 }
@@ -79,37 +123,3 @@ pub fn write_note(path: &Path, content: &str) -> std::io::Result<()> {
     fs::write(path, content)
 }
 
-/// Split markdown into blocks on blank lines, keeping fenced code blocks intact.
-pub fn split_blocks(text: &str) -> Vec<String> {
-    let mut blocks: Vec<String> = Vec::new();
-    let mut current: Vec<&str> = Vec::new();
-    let mut in_fence = false;
-
-    for line in text.split('\n') {
-        let trimmed = line.trim_start();
-        if trimmed.starts_with("```") || trimmed.starts_with("~~~") {
-            in_fence = !in_fence;
-        }
-        if line.trim().is_empty() && !in_fence {
-            if !current.is_empty() {
-                blocks.push(current.join("\n"));
-                current.clear();
-            }
-        } else {
-            current.push(line);
-        }
-    }
-    if !current.is_empty() {
-        blocks.push(current.join("\n"));
-    }
-    if blocks.is_empty() {
-        blocks.push(String::new());
-    }
-    blocks
-}
-
-pub fn join_blocks(blocks: &[String]) -> String {
-    let mut out = blocks.join("\n\n");
-    out.push('\n');
-    out
-}

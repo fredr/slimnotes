@@ -1,0 +1,11 @@
+[package]
+name = "slimnotes-editor"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "A from-scratch GPUI live-preview markdown editor."
+
+[dependencies]
+gpui = { workspace = true }
+pulldown-cmark = { workspace = true }
+image = { workspace = true }
