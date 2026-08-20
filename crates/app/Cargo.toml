@@ -6,13 +6,9 @@ license.workspace = true
 default-run = "slimnotes"
 
 [dependencies]
-slimnotes-core = { workspace = true }
+slimnotes-vault = { workspace = true }
 slimnotes-editor = { workspace = true }
-serde = { workspace = true }
-serde_json = { workspace = true }
-anyhow = { workspace = true }
 gpui = { workspace = true }
 gpui-component = { workspace = true }
 gpui-component-assets = { workspace = true }
-pulldown-cmark = { workspace = true }
-dirs = "6"
+anyhow = { workspace = true }

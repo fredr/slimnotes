@@ -1,9 +1,9 @@
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
-
-mod vault;
+#![allow(clippy::collapsible_if)]
 
 use std::collections::HashSet;
 use std::path::{Path, PathBuf};
+use std::rc::Rc;
 use std::time::Duration;
 
 use gpui::{
@@ -17,25 +17,26 @@ use gpui_component::{
     h_flex, v_flex, ActiveTheme, Disableable, IconName, Root, Sizable, Theme, ThemeMode,
 };
 use gpui_component_assets::Assets;
-use slimnotes_core::{Entry, Settings};
 use slimnotes_editor::{EditorEvent, MarkdownEditor};
+use slimnotes_vault::{self as vault, Entry, FileSig, Settings, VaultIndex, VaultWatcher};
 
 const CONTEXT: &str = "SlimNotes";
-
-/// The set of expanded folder paths saved for `vault` (empty if none saved, so
-/// folders start collapsed).
-fn expanded_for(settings: &Settings, vault: Option<&str>) -> HashSet<String> {
-    vault
-        .and_then(|v| settings.expanded_folders.get(v))
-        .map(|f| f.iter().cloned().collect())
-        .unwrap_or_default()
-}
 
 // Save the current note.
 actions!(slimnotes, [Save]);
 
+/// The set of expanded folder paths saved for `vault` (empty if none saved, so
+/// folders start collapsed).
+fn expanded_for(settings: &Settings, vault: Option<&Path>) -> HashSet<String> {
+    vault
+        .map(|v| v.to_string_lossy().into_owned())
+        .and_then(|v| settings.expanded_folders.get(&v))
+        .map(|f| f.iter().cloned().collect())
+        .unwrap_or_default()
+}
+
 /// Override gpui-component's default dark palette (near-black / near-white,
-/// high contrast) with a softer, Obsidian-like dark scheme.
+/// high contrast) with a softer dark scheme.
 fn apply_palette(cx: &mut App) {
     fn c(hex: u32) -> gpui::Hsla {
         gpui::rgb(hex).into()
@@ -59,7 +60,7 @@ fn apply_palette(cx: &mut App) {
     // Selected file / hover in the sidebar
     t.colors.sidebar_accent = c(0x363636);
     t.colors.sidebar_accent_foreground = c(0xffffff);
-    // Accent / links (Obsidian's purple)
+    // Accent / links
     t.colors.primary = c(0x9d86e9);
     t.colors.primary_foreground = c(0xffffff);
     t.colors.ring = c(0x9d86e9);
@@ -74,45 +75,137 @@ fn bind_keys(cx: &mut App) {
     ]);
 }
 
+/// The result of a background save attempt.
+enum SaveOutcome {
+    Saved(Option<FileSig>),
+    /// The file changed on disk since we loaded it — we did NOT overwrite.
+    Conflict,
+    Failed(String),
+}
+
 struct SlimNotes {
     focus_handle: FocusHandle,
     settings: Settings,
-    vault: Option<String>,
+    vault: Option<PathBuf>,
     tree: Vec<Entry>,
+    /// Basename index for `[[wikilink]]` / embed resolution, rebuilt in the
+    /// background when the vault changes or the watcher fires.
+    index: Option<Rc<VaultIndex>>,
     /// Folder paths the user has expanded in the current vault (folders default
-    /// to collapsed). Mirrors `settings.expanded_folders[vault]` for O(1) lookup
-    /// during tree rendering.
+    /// to collapsed). Mirrors `settings.expanded_folders[vault]` for O(1) lookup.
     expanded: HashSet<String>,
-    current: Option<String>,
+    current: Option<PathBuf>,
+    /// Disk signature of the open note when it was last loaded or saved, so an
+    /// external edit can be detected before autosave clobbers it.
+    open_sig: Option<FileSig>,
     editor: Option<Entity<MarkdownEditor>>,
+    /// A transient status/error line (save failure, on-disk conflict).
+    status: Option<String>,
     save_gen: u64,
     _editor_sub: Option<Subscription>,
+    _watcher: Option<VaultWatcher>,
 }
 
 impl SlimNotes {
     fn new(window: &mut Window, cx: &mut Context<Self>) -> Self {
         let settings = vault::load_settings();
         let vault = settings.vault.clone();
-        let tree = vault
-            .as_deref()
-            .map(|v| vault::read_tree(Path::new(v)))
-            .unwrap_or_default();
         let expanded = expanded_for(&settings, vault.as_deref());
 
         // Focus the root so keyboard shortcuts work before any block is edited.
         let focus_handle = cx.focus_handle();
         focus_handle.focus(window);
 
-        Self {
+        let mut this = Self {
             focus_handle,
             settings,
             vault,
-            tree,
+            tree: Vec::new(),
+            index: None,
             expanded,
             current: None,
+            open_sig: None,
             editor: None,
+            status: None,
             save_gen: 0,
             _editor_sub: None,
+            _watcher: None,
+        };
+        // Scan the tree + build the index off the UI thread, and start watching.
+        this.reload_vault(cx);
+        this.start_watcher(cx);
+        this
+    }
+
+    /// Rescan the vault tree and rebuild the resolver index on the background
+    /// executor, then swap the results in. Keeps a large vault from freezing the
+    /// UI on open / vault switch / external change.
+    fn reload_vault(&mut self, cx: &mut Context<Self>) {
+        let Some(root) = self.vault.clone() else {
+            self.tree = Vec::new();
+            self.index = None;
+            return;
+        };
+        cx.spawn(async move |this, cx| {
+            let (tree, index) = cx
+                .background_executor()
+                .spawn(async move {
+                    (vault::read_tree(&root), VaultIndex::build(&root))
+                })
+                .await;
+            this.update(cx, |this, cx| {
+                this.tree = tree;
+                this.index = Some(Rc::new(index));
+                cx.notify();
+            })
+            .ok();
+        })
+        .detach();
+    }
+
+    /// Watch the vault on disk so external edits (git, sync clients, Obsidian)
+    /// refresh the tree and are noticed before we overwrite them.
+    fn start_watcher(&mut self, cx: &mut Context<Self>) {
+        self._watcher = None;
+        let Some(root) = self.vault.clone() else { return };
+        let Ok((watcher, rx)) = vault::watch(&root) else { return };
+        self._watcher = Some(watcher);
+        cx.spawn(async move |this, cx| {
+            loop {
+                cx.background_executor()
+                    .timer(Duration::from_millis(500))
+                    .await;
+                let mut changed = false;
+                while rx.try_recv().is_ok() {
+                    changed = true;
+                }
+                let alive = this
+                    .update(cx, |this, cx| {
+                        if changed {
+                            this.on_vault_changed(cx);
+                        }
+                    })
+                    .is_ok();
+                if !alive {
+                    break; // the view was dropped
+                }
+            }
+        })
+        .detach();
+    }
+
+    /// The vault changed on disk: refresh the tree/index and flag it if the open
+    /// note itself was touched externally.
+    fn on_vault_changed(&mut self, cx: &mut Context<Self>) {
+        self.reload_vault(cx);
+        if let (Some(path), Some(prev)) = (self.current.clone(), self.open_sig) {
+            if let Some(cur) = vault::file_sig(&path) {
+                if cur != prev {
+                    self.status =
+                        Some("Note changed on disk — save will not overwrite it".to_string());
+                    cx.notify();
+                }
+            }
         }
     }
 
@@ -121,13 +214,19 @@ impl SlimNotes {
             self.expanded.insert(path.to_string());
         }
         // Persist the new expand/collapse state for this vault.
-        if let Some(vault) = self.vault.clone() {
+        if let Some(vault) = self.vault.as_ref().map(|v| v.to_string_lossy().into_owned()) {
             let mut folders: Vec<String> = self.expanded.iter().cloned().collect();
             folders.sort();
             self.settings.expanded_folders.insert(vault, folders);
-            vault::save_settings(&self.settings);
+            self.persist_settings();
         }
         cx.notify();
+    }
+
+    fn persist_settings(&mut self) {
+        if let Err(e) = vault::save_settings(&self.settings) {
+            self.status = Some(format!("Could not save settings: {e}"));
+        }
     }
 
     /// Vault-relative breadcrumb for the current note, e.g. "Projects / Alpha".
@@ -138,8 +237,8 @@ impl SlimNotes {
         let rel = self
             .vault
             .as_deref()
-            .and_then(|v| Path::new(current).strip_prefix(v).ok())
-            .unwrap_or_else(|| Path::new(current));
+            .and_then(|v| current.strip_prefix(v).ok())
+            .unwrap_or(current);
         rel.components()
             .map(|c| c.as_os_str().to_string_lossy())
             .map(|s| s.strip_suffix(".md").map(str::to_string).unwrap_or_else(|| s.into_owned()))
@@ -169,16 +268,17 @@ impl SlimNotes {
 
     fn set_vault(&mut self, path: PathBuf, cx: &mut Context<Self>) {
         self.save(cx);
-        let path_str = path.to_string_lossy().into_owned();
-        self.settings.vault = Some(path_str.clone());
-        vault::save_settings(&self.settings);
-
-        self.tree = vault::read_tree(&path);
-        self.expanded = expanded_for(&self.settings, Some(&path_str));
-        self.vault = Some(path_str);
+        self.settings.vault = Some(path.clone());
+        self.persist_settings();
+        self.expanded = expanded_for(&self.settings, Some(&path));
+        self.vault = Some(path);
         self.current = None;
+        self.open_sig = None;
         self.editor = None;
         self._editor_sub = None;
+        self.status = None;
+        self.reload_vault(cx);
+        self.start_watcher(cx);
         cx.notify();
     }
 
@@ -188,7 +288,7 @@ impl SlimNotes {
         let Some(vault) = self.vault.clone() else {
             return;
         };
-        let path = cx.prompt_for_new_path(Path::new(&vault), Some("Untitled.md"));
+        let path = cx.prompt_for_new_path(&vault, Some("Untitled.md"));
 
         let view = cx.entity();
         cx.spawn_in(window, async move |_, cx| {
@@ -209,19 +309,77 @@ impl SlimNotes {
         };
         // Create the file if it's new; don't clobber an existing note.
         if !path.exists() {
-            let _ = vault::write_note(&path, "");
+            if let Err(e) = vault::write_note(&path, "") {
+                self.status = Some(format!("Could not create note: {e}"));
+                cx.notify();
+                return;
+            }
         }
-        if let Some(vault) = self.vault.clone() {
-            self.tree = vault::read_tree(Path::new(&vault));
-        }
-        self.open_note(&path.to_string_lossy(), window, cx);
+        self.reload_vault(cx);
+        self.open_note(path, window, cx);
     }
 
-    fn save(&self, cx: &App) {
-        if let (Some(path), Some(editor)) = (&self.current, &self.editor) {
-            let content = editor.read(cx).text().to_string();
-            let _ = vault::write_note(Path::new(path), &content);
+    /// Snapshot the open note's content and write it atomically off the UI
+    /// thread, refusing to overwrite if the file changed on disk since we loaded
+    /// it. Surfaces failures/conflicts via `status`.
+    fn save(&mut self, cx: &mut Context<Self>) {
+        let (Some(path), Some(editor)) = (self.current.clone(), self.editor.clone()) else {
+            return;
+        };
+        let content = editor.read(cx).text().to_string();
+        let prev_sig = self.open_sig;
+        let done_path = path.clone(); // which note this save applies to
+        cx.spawn(async move |this, cx| {
+            let outcome = cx
+                .background_executor()
+                .spawn(async move {
+                    // Conflict: the file changed on disk since we loaded/saved it.
+                    if let (Some(prev), Some(cur)) = (prev_sig, vault::file_sig(&path)) {
+                        if cur != prev {
+                            return SaveOutcome::Conflict;
+                        }
+                    }
+                    match vault::write_note(&path, &content) {
+                        Ok(()) => SaveOutcome::Saved(vault::file_sig(&path)),
+                        Err(e) => SaveOutcome::Failed(e.to_string()),
+                    }
+                })
+                .await;
+            this.update(cx, |this, cx| this.finish_save(&done_path, outcome, cx))
+                .ok();
+        })
+        .detach();
+    }
+
+    /// Apply a save's outcome. `path` is the note the save was *for*: a save runs
+    /// in the background and can land after the user switched notes, so a stale
+    /// completion must not stamp its signature (or its error) onto the note that
+    /// is open now — that would make the next autosave see a bogus conflict and
+    /// silently refuse to write.
+    fn finish_save(&mut self, path: &Path, outcome: SaveOutcome, cx: &mut Context<Self>) {
+        if self.current.as_deref() != Some(path) {
+            return;
         }
+        match outcome {
+            SaveOutcome::Saved(sig) => {
+                self.open_sig = sig;
+                if self
+                    .status
+                    .as_deref()
+                    .is_some_and(|s| s.starts_with("Save failed"))
+                {
+                    self.status = None;
+                }
+            }
+            SaveOutcome::Conflict => {
+                self.status =
+                    Some("Note changed on disk — save skipped to avoid overwriting".to_string());
+            }
+            SaveOutcome::Failed(e) => {
+                self.status = Some(format!("Save failed: {e}"));
+            }
+        }
+        cx.notify();
     }
 
     /// Debounced autosave: write ~400ms after the last edit.
@@ -232,42 +390,76 @@ impl SlimNotes {
             cx.background_executor()
                 .timer(Duration::from_millis(400))
                 .await;
-            let _ = this.update(cx, |this, cx| {
+            this.update(cx, |this, cx| {
                 if this.save_gen == generation {
                     this.save(cx);
                 }
-            });
+            })
+            .ok();
         })
         .detach();
     }
 
-    fn open_note(&mut self, path: &str, window: &mut Window, cx: &mut Context<Self>) {
-        self.save(cx);
-        if let Ok(content) = vault::read_note(Path::new(path)) {
-            let base_dir = Path::new(path).parent().map(|p| p.to_path_buf());
-            let vault_dir = self.vault.as_ref().map(PathBuf::from);
-            let editor =
-                cx.new(|cx| MarkdownEditor::new(content, base_dir, vault_dir, window, cx));
-            let sub = cx.subscribe_in(
-                &editor,
-                window,
-                |this, _editor, event: &EditorEvent, window, cx| match event {
-                    EditorEvent::Changed => this.schedule_save(cx),
-                    EditorEvent::OpenNote(name) => this.open_note_by_name(name, window, cx),
-                },
-            );
-            self.editor = Some(editor);
-            self._editor_sub = Some(sub);
-            self.current = Some(path.to_string());
-            cx.notify();
-        }
+    fn open_note(&mut self, path: PathBuf, window: &mut Window, cx: &mut Context<Self>) {
+        self.save(cx); // flush the previous note (async, uses its captured path)
+        let view = cx.entity();
+        let read_path = path.clone();
+        cx.spawn_in(window, async move |_, cx| {
+            let (content, sig) = cx
+                .background_executor()
+                .spawn(async move {
+                    (vault::read_note(&read_path).ok(), vault::file_sig(&read_path))
+                })
+                .await;
+            let Some(content) = content else {
+                view.update(cx, |this, cx| {
+                    this.status = Some("Could not read note".to_string());
+                    cx.notify();
+                })
+                .ok();
+                return;
+            };
+            cx.update(|window, cx| {
+                view.update(cx, |this, cx| {
+                    this.install_editor(path, content, sig, window, cx);
+                });
+            })
+            .ok();
+        })
+        .detach();
+    }
+
+    fn install_editor(
+        &mut self,
+        path: PathBuf,
+        content: String,
+        sig: Option<FileSig>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let base_dir = path.parent().map(|p| p.to_path_buf());
+        let vault_dir = self.vault.clone();
+        let editor = cx.new(|cx| MarkdownEditor::new(content, base_dir, vault_dir, window, cx));
+        let sub = cx.subscribe_in(
+            &editor,
+            window,
+            |this, _editor, event: &EditorEvent, window, cx| match event {
+                EditorEvent::Changed => this.schedule_save(cx),
+                EditorEvent::OpenNote(name) => this.open_note_by_name(name, window, cx),
+            },
+        );
+        self.editor = Some(editor);
+        self._editor_sub = Some(sub);
+        self.current = Some(path);
+        self.open_sig = sig;
+        self.status = None;
+        cx.notify();
     }
 
     /// Open a note by its `[[wikilink]]` name, resolved across the vault.
     fn open_note_by_name(&mut self, name: &str, window: &mut Window, cx: &mut Context<Self>) {
-        let Some(vault) = self.vault.clone() else { return };
-        if let Some(path) = vault::resolve_note(Path::new(&vault), name) {
-            self.open_note(&path.to_string_lossy(), window, cx);
+        if let Some(path) = self.index.as_ref().and_then(|i| i.resolve_note(name)) {
+            self.open_note(path, window, cx);
         }
     }
 
@@ -283,7 +475,7 @@ impl SlimNotes {
         let vault_name = self
             .vault
             .as_deref()
-            .and_then(|v| Path::new(v).file_name())
+            .and_then(|v| v.file_name())
             .map(|n| n.to_string_lossy().into_owned())
             .unwrap_or_else(|| "No vault".to_string());
 
@@ -365,10 +557,11 @@ impl SlimNotes {
 
         for entry in entries {
             if entry.is_dir {
-                let path = entry.path.clone();
+                let path = entry.path.to_string_lossy().into_owned();
                 let collapsed = !self.expanded.contains(&path);
                 let chevron = if collapsed { "▸" } else { "▾" };
                 let name = entry.name.clone();
+                let toggle_path = path.clone();
                 out.push(
                     h_flex()
                         .id(SharedString::from(format!("dir-{path}")))
@@ -390,7 +583,7 @@ impl SlimNotes {
                         )
                         .child(div().flex_1().truncate().child(SharedString::from(name)))
                         .on_click(cx.listener(move |this, _, _, cx| {
-                            this.toggle_folder(&path, cx);
+                            this.toggle_folder(&toggle_path, cx);
                         }))
                         .into_any_element(),
                 );
@@ -399,11 +592,12 @@ impl SlimNotes {
                 }
             } else {
                 let path = entry.path.clone();
-                let is_current = self.current.as_deref() == Some(path.as_str());
+                let id = path.to_string_lossy().into_owned();
+                let is_current = self.current.as_deref() == Some(path.as_path());
                 let label = entry.name.strip_suffix(".md").unwrap_or(&entry.name).to_string();
 
                 let mut row = h_flex()
-                    .id(SharedString::from(format!("file-{path}")))
+                    .id(SharedString::from(format!("file-{id}")))
                     .items_center()
                     .pl(pad_left)
                     .pr_2()
@@ -415,7 +609,7 @@ impl SlimNotes {
                     .hover(move |s| s.bg(hover))
                     .child(div().flex_1().truncate().child(SharedString::from(label)))
                     .on_click(cx.listener(move |this, _, window, cx| {
-                        this.open_note(&path, window, cx);
+                        this.open_note(path.clone(), window, cx);
                     }));
 
                 if is_current {
@@ -430,6 +624,7 @@ impl SlimNotes {
     fn render_content(&self, cx: &mut Context<Self>) -> AnyElement {
         let muted = cx.theme().muted_foreground;
         let border = cx.theme().border;
+        let warn = gpui::rgb(0xdd8a8a);
 
         let Some(editor) = &self.editor else {
             let message = if self.vault.is_none() {
@@ -447,22 +642,26 @@ impl SlimNotes {
                 .into_any_element();
         };
 
+        let mut header = h_flex()
+            .flex_shrink_0()
+            .items_center()
+            .justify_between()
+            .h(px(40.))
+            .px(px(40.))
+            .border_b_1()
+            .border_color(border)
+            .text_size(px(13.))
+            .text_color(muted)
+            .child(SharedString::from(self.breadcrumb()));
+        if let Some(status) = &self.status {
+            header = header.child(div().text_color(warn).child(SharedString::from(status.clone())));
+        }
+
         v_flex()
             .flex_1()
             .h_full()
             .min_w(px(0.))
-            .child(
-                h_flex()
-                    .flex_shrink_0()
-                    .items_center()
-                    .h(px(40.))
-                    .px(px(40.))
-                    .border_b_1()
-                    .border_color(border)
-                    .text_size(px(13.))
-                    .text_color(muted)
-                    .child(SharedString::from(self.breadcrumb())),
-            )
+            .child(header)
             .child(
                 // The editor manages its own scrolling; clip it to this pane.
                 div()

@@ -1,6 +1,6 @@
 [workspace]
 resolver = "3"
-members = ["crates/core", "crates/editor", "crates/app"]
+members = ["crates/vault", "crates/editor", "crates/app"]
 
 [workspace.package]
 version = "0.1.0"
@@ -11,7 +11,7 @@ license = "MIT"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 anyhow = "1"
-slimnotes-core = { path = "crates/core" }
+slimnotes-vault = { path = "crates/vault" }
 slimnotes-editor = { path = "crates/editor" }
 
 # GPUI (Zed's UI framework) + the gpui-component widget library. gpui-component
@@ -23,6 +23,11 @@ pulldown-cmark = { version = "0.13", default-features = false }
 # Same major as gpui's own image dep, so `image::Frame` is the exact type
 # `RenderImage::new` expects.
 image = "0.25"
+# Rope buffer for the editor: O(log n) edits + byte<->line math, so edit cost is
+# independent of note size (v2 substrate).
+ropey = "1.6"
+# Filesystem watcher, so the vault on disk is the live source of truth.
+notify = "8"
 
 # Optimize dependencies even in dev builds. Text shaping (rustybuzz/cosmic-text,
 # via gpui) is ~50x slower unoptimized, which made large notes freeze for seconds
