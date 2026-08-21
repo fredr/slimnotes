@@ -67,7 +67,6 @@ pub(crate) struct Layout {
     /// index straight into it.
     pub(crate) lines: Vec<VisualLine>,
     pub(crate) total_height: Pixels,
-    pub(crate) viewport_height: Pixels,
     pub(crate) links: Links, // document source range -> link target
 }
 

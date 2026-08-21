@@ -31,6 +31,7 @@ mod images;
 mod input;
 mod layout;
 mod parse;
+mod scrollbar;
 mod segments;
 mod tables;
 
@@ -41,6 +42,7 @@ pub(crate) use images::*;
 pub(crate) use input::*;
 pub(crate) use layout::*;
 pub(crate) use parse::*;
+pub(crate) use scrollbar::*;
 pub(crate) use segments::*;
 pub(crate) use tables::*;
 
@@ -63,10 +65,20 @@ pub(crate) const ACCENT: u32 = 0x9d86e9;
 pub(crate) const HIGHLIGHT_BG: u32 = 0xd6c04a; // ==highlight== background (highlighter yellow)
 pub(crate) const HIGHLIGHT_FG: u32 = 0x1e1e1e; // dark text on the highlight
 pub(crate) const TAG_BG: u32 = 0x9d86e933; // #tag pill background (translucent accent)
+pub(crate) const SCROLLBAR: u32 = 0x6e6e6e66; // overlay thumb, idle (translucent grey)
+pub(crate) const SCROLLBAR_HOVER: u32 = 0x9a9a9acc; // thumb while hovered or dragged
 
 pub(crate) const IMAGE_MAX_H: f32 = 400.0; // cap rendered image height (px)
 pub(crate) const IMAGE_PAD: f32 = 6.0; // vertical breathing room around an image (px)
 pub(crate) const QUOTE_INDENT: f32 = 22.0; // left indent per blockquote nesting level (px)
+
+/// Inset from the window edge to the text, on all four sides.
+///
+/// The element itself spans the *whole* window so the scrollbar can hug the edge
+/// and run the full height, so the element owns this padding rather than getting
+/// it from a wrapper div. 32px is what the previous `.p_8()` resolved to
+/// (`rems(2.)` at gpui's default 16px rem), so the text lands on the same pixels.
+pub(crate) const CONTENT_PAD: f32 = 32.0;
 
 // Fonts are bundled (see `fonts/`) and registered at startup, so these families
 // are always present and render identically without system fonts. GPUI's default
@@ -132,6 +144,22 @@ pub struct MarkdownEditor {
     pub(crate) dragging: bool,
     pub(crate) scroll_top: Pixels,
     pub(crate) scroll_to_caret: bool,
+    /// Height of the content box in the last painted frame. Lives here rather
+    /// than on `Layout` because it is a property of the *frame*, not of the text:
+    /// a height-only resize must not invalidate the layout (that would undo
+    /// virtualization's win), yet page-scrolling and the scrollbar need the
+    /// current value. Refreshed on every prepaint path via `finish`.
+    pub(crate) viewport_height: Pixels,
+    /// Height of the scrollbar track: the *whole* window, not the inset content
+    /// box, so the thumb can reach the very top and bottom. Kept alongside
+    /// `viewport_height` rather than derived from it, since the content box is
+    /// clamped at zero for a window narrower/shorter than the padding.
+    pub(crate) scroll_track: Pixels,
+    /// While dragging the scrollbar thumb: the grab point's offset from the
+    /// thumb's top, so the thumb follows the pointer 1:1.
+    pub(crate) scrollbar_drag: Option<Pixels>,
+    /// Pointer is over the scrollbar strip (or dragging it) — drawn brighter.
+    pub(crate) scrollbar_hover: bool,
     pub(crate) layout: Option<Rc<Layout>>, // last painted layout, for movement + hit-testing
     pub(crate) focus_handle: FocusHandle,
     base_dir: Option<PathBuf>,  // note folder, for resolving relative image paths
@@ -179,6 +207,10 @@ impl MarkdownEditor {
             dragging: false,
             scroll_top: px(0.),
             scroll_to_caret: true,
+            viewport_height: px(0.),
+            scroll_track: px(0.),
+            scrollbar_drag: None,
+            scrollbar_hover: false,
             layout: None,
             focus_handle,
             base_dir,
@@ -515,12 +547,30 @@ impl MarkdownEditor {
         }
     }
 
+    /// Thumb geometry for the current frame, or `None` when the document fits and
+    /// no scrollbar is shown. Uses the layout's exact `total_height`, so the thumb
+    /// is correctly sized even though most lines are never shaped.
+    pub(crate) fn scrollbar(&self) -> Option<ScrollbarGeom> {
+        let layout = self.layout.as_ref()?;
+        scrollbar_geom(
+            layout.total_height,
+            self.viewport_height,
+            self.scroll_top,
+            self.scroll_track,
+        )
+    }
+
+    /// Total document height as of the last layout (0 before the first one).
+    pub(crate) fn total_height(&self) -> Pixels {
+        self.layout.as_ref().map(|l| l.total_height).unwrap_or(px(0.))
+    }
+
     /// Move the caret ~one viewport up/down, keeping the goal column (PageUp/Down).
     fn move_page(&mut self, down: bool, shift: bool) {
         let Some(layout) = self.layout.clone() else { return };
         let Some((x, y, _lh)) = layout.caret(self.cursor) else { return };
         let goal = self.goal_x.unwrap_or(x);
-        let vh = layout.viewport_height;
+        let vh = self.viewport_height;
         let target_y = if down { y + vh } else { (y - vh).max(px(0.)) };
         let new = layout.offset_at(goal, target_y);
         self.set_cursor(new, shift);
@@ -835,8 +885,10 @@ impl Render for MarkdownEditor {
             .text_color(rgb(TEXT))
             .track_focus(&self.focus_handle)
             .key_context(input::CONTEXT);
+        // No padding here: the element takes the full window rect so the overlay
+        // scrollbar can sit at the very edge, and insets the text itself by
+        // `CONTENT_PAD`.
         self.on_input_actions(root, cx)
-            .p_8()
             .child(EditorElement {
                 editor: cx.entity(),
             })
@@ -883,7 +935,6 @@ mod tests {
         Layout {
             lines,
             total_height: top,
-            viewport_height: px(100.),
             links: Vec::new(),
         }
     }
@@ -915,6 +966,38 @@ mod tests {
         assert_eq!(l.line_index_at_offset(16), Some(2));
         assert_eq!(l.line_index_at_offset(usize::MAX), Some(2));
         assert_eq!(geom_layout(&[]).line_index_at_offset(0), None);
+    }
+
+    #[test]
+    fn content_rect_insets_the_window_on_all_sides() {
+        use gpui::{size, Bounds};
+        let pad = CONTENT_PAD;
+        let b = Bounds {
+            origin: gpui::point(px(0.), px(0.)),
+            size: size(px(900.), px(700.)),
+        };
+        let c = content_rect(b);
+        assert_eq!(f32::from(c.origin.x), pad);
+        assert_eq!(f32::from(c.origin.y), pad);
+        assert_eq!(f32::from(c.size.width), 900. - pad * 2.);
+        assert_eq!(f32::from(c.size.height), 700. - pad * 2.);
+        // The inset is relative to the element's origin, not the screen's.
+        let b = Bounds {
+            origin: gpui::point(px(10.), px(20.)),
+            size: size(px(900.), px(700.)),
+        };
+        let c = content_rect(b);
+        assert_eq!(f32::from(c.origin.x), 10. + pad);
+        assert_eq!(f32::from(c.origin.y), 20. + pad);
+        // A window smaller than the padding clamps to zero rather than going
+        // negative (which would make the wrap width and viewport nonsense).
+        let b = Bounds {
+            origin: gpui::point(px(0.), px(0.)),
+            size: size(px(10.), px(10.)),
+        };
+        let c = content_rect(b);
+        assert_eq!(f32::from(c.size.width), 0.);
+        assert_eq!(f32::from(c.size.height), 0.);
     }
 
     #[test]

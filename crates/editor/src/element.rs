@@ -5,7 +5,7 @@ use std::collections::HashMap;
 use std::rc::Rc;
 
 use gpui::{
-    fill, point, px, quad, relative, rgb, size, transparent_black, App, BorderStyle, Bounds,
+    fill, point, px, quad, relative, rgb, rgba, size, transparent_black, App, BorderStyle, Bounds,
     ContentMask, Corners, DispatchPhase, Element, ElementId, ElementInputHandler, Entity,
     FontWeight, GlobalElementId, InspectorElementId, IntoElement, LayoutId, MouseButton,
     MouseDownEvent, MouseMoveEvent, MouseUpEvent, Pixels, ScrollDelta, ScrollWheelEvent,
@@ -256,6 +256,23 @@ pub(crate) fn resolve_scroll(
     scroll_top.clamp(px(0.), max_scroll)
 }
 
+/// The text area: the element's rect inset by [`CONTENT_PAD`] on all four sides.
+///
+/// The element spans the whole window so the overlay scrollbar can hug the right
+/// edge and run the full height, so everything text-related — wrap width, the
+/// scrollable viewport, painting and hit-testing — works in this rect instead of
+/// the element's own bounds.
+pub(crate) fn content_rect(bounds: Bounds<Pixels>) -> Bounds<Pixels> {
+    let pad = px(CONTENT_PAD);
+    Bounds {
+        origin: point(bounds.origin.x + pad, bounds.origin.y + pad),
+        size: size(
+            (bounds.size.width - pad * 2.).max(px(0.)),
+            (bounds.size.height - pad * 2.).max(px(0.)),
+        ),
+    }
+}
+
 /// Which source lines must be shaped for this frame: the visible window plus an
 /// overscan margin, so ordinary scrolling doesn't need to shape anything new.
 pub(crate) fn shape_window(
@@ -318,6 +335,8 @@ impl EditorElement {
         &mut self,
         layout: Rc<Layout>,
         scroll_top: Pixels,
+        viewport_height: Pixels,
+        scroll_track: Pixels,
         cursor: usize,
         selection: Option<(usize, usize)>,
         cx: &mut App,
@@ -325,6 +344,12 @@ impl EditorElement {
         let marked = self.editor.update(cx, |e, _| {
             e.scroll_top = scroll_top;
             e.scroll_to_caret = false;
+            // Every prepaint path ends here, so this is the one place the frame's
+            // viewport height and scrollbar track are published — they can never
+            // go stale, not even on the reuse path (a height-only resize rebuilds
+            // nothing).
+            e.viewport_height = viewport_height;
+            e.scroll_track = scroll_track;
             e.marked_range.as_ref().map(|r| (r.start, r.end))
         });
         Prepaint {
@@ -636,6 +661,15 @@ impl EditorElement {
             Some((_, sz)) => sz.height + px(IMAGE_PAD * 2.),
             None => wrapped.size(lh).height,
         };
+        // Hanging indent only means anything with continuation rows to shift, and
+        // paint/`x_offset` both ignore it on a single-row line. Normalize it to
+        // zero there so this path agrees with the deferred (one-row) path above
+        // field-for-field — otherwise the two differ for every single-row list
+        // item, which makes `SLIMNOTES_NO_VIRT=1` a useless control for proving
+        // that virtualization changes nothing but *which* lines get shaped.
+        if height <= lh {
+            hang = px(0.);
+        }
         VisualLine {
             start: offset,
             source: line.to_string(),
@@ -745,8 +779,12 @@ impl Element for EditorElement {
                 e.buffer.version(),
             )
         };
-        let wrap_width = bounds.size.width.max(px(80.));
-        let viewport_height = bounds.size.height;
+        // Text lives in the inset rect; the element's own bounds are the window
+        // (so the scrollbar can reach its edges).
+        let content = content_rect(bounds);
+        let wrap_width = content.size.width.max(px(80.));
+        let viewport_height = content.size.height;
+        let scroll_track = bounds.size.height;
         let sig = LayoutSig { version, width: f32::from(wrap_width).to_bits() };
         let reveal = Reveal { cursor, sel: selection };
 
@@ -783,7 +821,15 @@ impl Element for EditorElement {
                     e.shaped_range = want.start.min(caret_line)..want.end.max(caret_line + 1);
                 });
             }
-            return self.finish(layout, scroll_top, cursor, selection, cx);
+            return self.finish(
+                layout,
+                scroll_top,
+                viewport_height,
+                scroll_track,
+                cursor,
+                selection,
+                cx,
+            );
         }
 
         let text = self.editor.read(cx).text.clone();
@@ -869,7 +915,6 @@ impl Element for EditorElement {
                 let scroll_top = {
                     let l = Rc::make_mut(&mut layout);
                     l.total_height = total;
-                    l.viewport_height = viewport_height;
                     resolve_scroll(l, scroll_top, scroll_to_caret, cursor, viewport_height)
                 };
                 let lines = &mut Rc::make_mut(&mut layout).lines;
@@ -884,7 +929,15 @@ impl Element for EditorElement {
                     e.shapes = shapes;
                     e.shaped_range = shaped_range;
                 });
-                return self.finish(layout, scroll_top, cursor, selection, cx);
+                return self.finish(
+                layout,
+                scroll_top,
+                viewport_height,
+                scroll_track,
+                cursor,
+                selection,
+                cx,
+            );
             }
         }
 
@@ -912,7 +965,6 @@ impl Element for EditorElement {
         let mut layout = Layout {
             lines,
             total_height,
-            viewport_height,
             links: parsed.links.clone(),
         };
         let caret_line = ctx.cursor_line.min(layout.lines.len().saturating_sub(1));
@@ -975,7 +1027,15 @@ impl Element for EditorElement {
             e.shapes = shapes;
             e.shaped_range = shaped_range;
         });
-        self.finish(layout, scroll_top, cursor, selection, cx)
+        self.finish(
+                layout,
+                scroll_top,
+                viewport_height,
+                scroll_track,
+                cursor,
+                selection,
+                cx,
+            )
     }
 
     fn paint(
@@ -988,22 +1048,27 @@ impl Element for EditorElement {
         window: &mut Window,
         cx: &mut App,
     ) {
-        // Route platform text input (and IME composition) at this element's
-        // bounds. Must happen during paint — `handle_input` asserts that phase —
-        // and it is what delivers typed characters to the buffer.
+        // `bounds` is the whole window (so the scrollbar can reach its edges);
+        // the text lives in the inset rect, so everything below works in
+        // `content` and only the scrollbar uses `bounds`.
+        let content = content_rect(bounds);
+
+        // Route platform text input (and IME composition) at the text area. Must
+        // happen during paint — `handle_input` asserts that phase — and it is what
+        // delivers typed characters to the buffer.
         let focus_handle = self.editor.read(cx).focus_handle.clone();
         window.handle_input(
             &focus_handle,
-            ElementInputHandler::new(bounds, self.editor.clone()),
+            ElementInputHandler::new(content, self.editor.clone()),
             cx,
         );
 
         let st = prepaint.scroll_top;
-        let top_edge = bounds.origin.y;
-        let bottom_edge = bounds.origin.y + bounds.size.height;
+        let top_edge = content.origin.y;
+        let bottom_edge = content.origin.y + content.size.height;
 
         for line in &prepaint.layout.lines {
-            let screen_top = bounds.origin.y - st + line.top;
+            let screen_top = content.origin.y - st + line.top;
             if screen_top + line.height < top_edge || screen_top > bottom_edge {
                 continue;
             }
@@ -1011,15 +1076,15 @@ impl Element for EditorElement {
             // Code-block panel: a contiguous full-width shaded band.
             if line.code_bg {
                 let rect = Bounds {
-                    origin: point(bounds.origin.x - px(8.), screen_top),
-                    size: size(bounds.size.width + px(16.), line.height),
+                    origin: point(content.origin.x - px(8.), screen_top),
+                    size: size(content.size.width + px(16.), line.height),
                 };
                 window.paint_quad(fill(rect, rgb(CODE_PANEL)));
             }
 
             // Blockquote bars, one per nesting level, in the left inset.
             for k in 0..line.quote_bars {
-                let bx = bounds.origin.x + px(QUOTE_INDENT * k as f32) + px(3.);
+                let bx = content.origin.x + px(QUOTE_INDENT * k as f32) + px(3.);
                 let rect = Bounds {
                     origin: point(bx, screen_top),
                     size: size(px(3.), line.height),
@@ -1045,7 +1110,7 @@ impl Element for EditorElement {
                     let paint_row = |win: &mut Window, x0: Pixels, x1: Pixels, row_y: Pixels| {
                         let shift = line.x_offset(row_y);
                         let rect = Bounds {
-                            origin: point(bounds.origin.x + x0 + shift, screen_top + row_y),
+                            origin: point(content.origin.x + x0 + shift, screen_top + row_y),
                             size: size((x1 - x0).max(px(3.)), lh),
                         };
                         win.paint_quad(fill(rect, rgb(SELECTION)));
@@ -1086,7 +1151,7 @@ impl Element for EditorElement {
                 let shift = line.x_offset(pa.y);
                 let rect = Bounds {
                     origin: point(
-                        bounds.origin.x + pa.x + shift,
+                        content.origin.x + pa.x + shift,
                         screen_top + pa.y + lh - px(2.),
                     ),
                     size: size((pb.x - pa.x).max(px(2.)), px(1.)),
@@ -1096,7 +1161,7 @@ impl Element for EditorElement {
 
             if let Some((data, sz)) = &line.image {
                 let rect = Bounds {
-                    origin: point(bounds.origin.x, screen_top + px(IMAGE_PAD)),
+                    origin: point(content.origin.x, screen_top + px(IMAGE_PAD)),
                     size: *sz,
                 };
                 let _ = window.paint_image(rect, Corners::all(px(4.)), data.clone(), 0, false);
@@ -1108,8 +1173,8 @@ impl Element for EditorElement {
                 paint_selection(window);
                 paint_marked(window);
                 let rect = Bounds {
-                    origin: point(bounds.origin.x, screen_top + line.height / 2. - px(1.)),
-                    size: size(bounds.size.width, px(2.)),
+                    origin: point(content.origin.x, screen_top + line.height / 2. - px(1.)),
+                    size: size(content.size.width, px(2.)),
                 };
                 window.paint_quad(fill(rect, rgb(MUTED)));
                 continue;
@@ -1118,7 +1183,7 @@ impl Element for EditorElement {
             // Table row: each cell as a bordered, padded, aligned box.
             if let Some(TableRender::Row(cells)) = &line.table {
                 for cell in cells {
-                    let cx0 = bounds.origin.x + cell.x;
+                    let cx0 = content.origin.x + cell.x;
                     let rect = Bounds {
                         origin: point(cx0, screen_top),
                         size: size(cell.width, line.height),
@@ -1144,7 +1209,7 @@ impl Element for EditorElement {
             }
 
             let lh = line.line_height;
-            let base_x = bounds.origin.x + line.left_inset;
+            let base_x = content.origin.x + line.left_inset;
             // An unshaped line has nothing to draw. It is off-screen by
             // construction (prepaint shapes the visible window), so this is just
             // belt-and-braces against painting a line we deliberately skipped.
@@ -1152,8 +1217,8 @@ impl Element for EditorElement {
             if line.hang > px(0.) && line.height > lh {
                 // Hanging indent: paint row 0 at the margin, continuation rows
                 // shifted right, using vertical content masks to split them.
-                let fx = bounds.origin.x - px(16.);
-                let fw = bounds.size.width + px(32.);
+                let fx = content.origin.x - px(16.);
+                let fw = content.size.width + px(32.);
                 let mask0 = ContentMask {
                     bounds: Bounds { origin: point(fx, screen_top), size: size(fw, lh) },
                 };
@@ -1193,7 +1258,7 @@ impl Element for EditorElement {
                 let side = lh * 0.62;
                 let pad = (lh - side) / 2.;
                 let rect = Bounds {
-                    origin: point(bounds.origin.x + p.x + px(1.), screen_top + pad),
+                    origin: point(content.origin.x + p.x + px(1.), screen_top + pad),
                     size: size(side, side),
                 };
                 let radii = Corners::all(px(3.));
@@ -1238,21 +1303,53 @@ impl Element for EditorElement {
 
         // Caret.
         if let Some((x, cy, lh)) = prepaint.layout.caret(prepaint.cursor) {
-            let sy = bounds.origin.y - st + cy;
+            let sy = content.origin.y - st + cy;
             let caret = Bounds {
-                origin: point(bounds.origin.x + x, sy + px(1.)),
+                origin: point(content.origin.x + x, sy + px(1.)),
                 size: size(px(2.), lh - px(2.)),
             };
             window.paint_quad(fill(caret, rgb(CARET)));
+        }
+
+        // Overlay scrollbar, painted last so it sits above the text. It hugs the
+        // window's right edge and its track spans the full window height, so it
+        // is drawn against `bounds` while its proportion comes from the inset
+        // text viewport. Sized from the layout's exact `total_height`, which
+        // virtualization keeps correct without shaping the whole document.
+        if let Some(g) = scrollbar_geom(
+            prepaint.layout.total_height,
+            content.size.height,
+            st,
+            bounds.size.height,
+        ) {
+            let hot = self.editor.read(cx).scrollbar_hover;
+            let rect = Bounds {
+                origin: point(
+                    bounds.origin.x + bounds.size.width - px(SCROLLBAR_W + SCROLLBAR_MARGIN),
+                    bounds.origin.y + g.thumb_top,
+                ),
+                size: size(px(SCROLLBAR_W), g.thumb_len),
+            };
+            window.paint_quad(quad(
+                rect,
+                Corners::all(px(SCROLLBAR_W / 2.)),
+                rgba(if hot { SCROLLBAR_HOVER } else { SCROLLBAR }),
+                px(0.),
+                transparent_black(),
+                BorderStyle::Solid,
+            ));
         }
 
         // Mouse: click-to-place, drag-to-select.
         window.on_mouse_event({
             let editor = self.editor.clone();
             move |ev: &MouseDownEvent, phase, window, cx| {
+                // Only the text area places the caret; the surrounding padding and
+                // the scrollbar strip are not text (matching the behavior from when
+                // a padded wrapper div bounded this element).
                 if phase != DispatchPhase::Bubble
                     || ev.button != MouseButton::Left
-                    || !bounds.contains(&ev.position)
+                    || !content.contains(&ev.position)
                 {
                     return;
                 }
@@ -1266,9 +1363,16 @@ impl Element for EditorElement {
                         cx.notify();
                         return;
                     }
+                    // A press in the scrollbar strip belongs to the scrollbar
+                    // (handled below); don't also move the caret or start a
+                    // selection. Checked here rather than relying on handler
+                    // ordering, which GPUI doesn't guarantee.
+                    if e.scrollbar().is_some() && in_scrollbar_strip(&bounds, ev.position) {
+                        return;
+                    }
                     let Some(layout) = e.layout.clone() else { return };
-                    let x = ev.position.x - bounds.origin.x;
-                    let content_y = ev.position.y - bounds.origin.y + e.scroll_top;
+                    let x = ev.position.x - content.origin.x;
+                    let content_y = ev.position.y - content.origin.y + e.scroll_top;
                     e.focus_handle.focus(window);
                     e.goal_x = None; // a click recomputes the goal column next time
                     // Double-click selects the word under the cursor; triple-click
@@ -1341,8 +1445,8 @@ impl Element for EditorElement {
                         return;
                     }
                     let Some(layout) = e.layout.clone() else { return };
-                    let content_y = ev.position.y - bounds.origin.y + e.scroll_top;
-                    e.cursor = layout.offset_at(ev.position.x - bounds.origin.x, content_y);
+                    let content_y = ev.position.y - content.origin.y + e.scroll_top;
+                    e.cursor = layout.offset_at(ev.position.x - content.origin.x, content_y);
                     e.goal_x = None;
                     cx.notify();
                 });
@@ -1354,7 +1458,89 @@ impl Element for EditorElement {
                 if phase != DispatchPhase::Bubble || ev.button != MouseButton::Left {
                     return;
                 }
-                editor.update(cx, |e, _| e.dragging = false);
+                editor.update(cx, |e, cx| {
+                    e.dragging = false;
+                    if e.scrollbar_drag.take().is_some() {
+                        cx.notify(); // the thumb goes back to its idle shade
+                    }
+                });
+            }
+        });
+        // Scrollbar: grab the thumb to drag, or click the track to page.
+        window.on_mouse_event({
+            let editor = self.editor.clone();
+            move |ev: &MouseDownEvent, phase, _window, cx| {
+                if phase != DispatchPhase::Bubble
+                    || ev.button != MouseButton::Left
+                    || !in_scrollbar_strip(&bounds, ev.position)
+                {
+                    return;
+                }
+                editor.update(cx, |e, cx| {
+                    // An open menu swallows the click (the text handler closes it).
+                    if e.table_menu.is_some() {
+                        return;
+                    }
+                    let Some(g) = e.scrollbar() else { return };
+                    let y = ev.position.y - bounds.origin.y; // relative to the track
+                    if y >= g.thumb_top && y <= g.thumb_top + g.thumb_len {
+                        // Remember where in the thumb we grabbed, so it follows
+                        // the pointer 1:1 instead of jumping.
+                        e.scrollbar_drag = Some(y - g.thumb_top);
+                    } else {
+                        // Track click: jump straight to that spot in the
+                        // document (centring the thumb on the click) rather than
+                        // paging toward it — in a long note the thumb is at its
+                        // minimum length, so paging would take dozens of clicks
+                        // to cross the track. Then hand over to the drag path
+                        // with the grab at the thumb's middle, so press-and-move
+                        // keeps scrubbing from where you clicked.
+                        let grab = g.thumb_len / 2.;
+                        e.scroll_top = scroll_for_thumb_top(
+                            e.total_height(),
+                            e.viewport_height,
+                            y - grab,
+                            g.track,
+                        );
+                        e.scrollbar_drag = Some(grab);
+                    }
+                    e.scrollbar_hover = true;
+                    e.dragging = false; // never a text selection
+                    e.scroll_to_caret = false; // and don't snap back to the caret
+                    cx.notify();
+                });
+            }
+        });
+        // Scrollbar drag + hover highlight.
+        window.on_mouse_event({
+            let editor = self.editor.clone();
+            move |ev: &MouseMoveEvent, phase, _window, cx| {
+                if phase != DispatchPhase::Bubble {
+                    return;
+                }
+                editor.update(cx, |e, cx| {
+                    if let Some(grab) = e.scrollbar_drag {
+                        if ev.pressed_button == Some(MouseButton::Left) {
+                            let y = ev.position.y - bounds.origin.y - grab;
+                            e.scroll_top = scroll_for_thumb_top(
+                                e.total_height(),
+                                e.viewport_height,
+                                y,
+                                e.scroll_track,
+                            );
+                            e.scroll_to_caret = false;
+                            cx.notify();
+                            return;
+                        }
+                        e.scrollbar_drag = None; // released outside the window
+                    }
+                    let over =
+                        e.scrollbar().is_some() && in_scrollbar_strip(&bounds, ev.position);
+                    if over != e.scrollbar_hover {
+                        e.scrollbar_hover = over;
+                        cx.notify();
+                    }
+                });
             }
         });
         // Right-click on a table cell opens its add/delete row/column menu.
@@ -1363,14 +1549,14 @@ impl Element for EditorElement {
             move |ev: &MouseDownEvent, phase, window, cx| {
                 if phase != DispatchPhase::Bubble
                     || ev.button != MouseButton::Right
-                    || !bounds.contains(&ev.position)
+                    || !content.contains(&ev.position)
                 {
                     return;
                 }
                 editor.update(cx, |e, cx| {
                     let Some(layout) = e.layout.clone() else { return };
-                    let x = ev.position.x - bounds.origin.x;
-                    let content_y = ev.position.y - bounds.origin.y + e.scroll_top;
+                    let x = ev.position.x - content.origin.x;
+                    let content_y = ev.position.y - content.origin.y + e.scroll_top;
                     if let Some((line_start_off, col)) = layout.table_cell_at(x, content_y) {
                         e.focus_handle.focus(window);
                         let line = offset_to_line_col(&e.text, line_start_off).0;
@@ -1383,7 +1569,8 @@ impl Element for EditorElement {
                 });
             }
         });
-        // Scroll wheel.
+        // Scroll wheel. Deliberately the full window rect, not the text area: the
+        // wheel should work over the margins and over the scrollbar too.
         window.on_mouse_event({
             let editor = self.editor.clone();
             move |ev: &ScrollWheelEvent, phase, _window, cx| {
@@ -1396,10 +1583,11 @@ impl Element for EditorElement {
                         ScrollDelta::Pixels(p) => p.y,
                         ScrollDelta::Lines(l) => l.y * px(40.),
                     };
+                    let vh = e.viewport_height;
                     let max = e
                         .layout
                         .as_ref()
-                        .map(|l| (l.total_height - l.viewport_height).max(px(0.)))
+                        .map(|l| max_scroll(l.total_height, vh))
                         .unwrap_or(px(0.));
                     e.scroll_top = (e.scroll_top - dy).clamp(px(0.), max);
                     e.scroll_to_caret = false;
