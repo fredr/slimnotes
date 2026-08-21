@@ -18,11 +18,12 @@ use std::ops::Range;
 use std::path::PathBuf;
 use std::rc::Rc;
 use std::sync::Arc;
+use std::time::Duration;
 
 use gpui::{
     anchored, deferred, div, point, px, rgb, size, App, Bounds, ClipboardItem, Context,
     EntityInputHandler, EventEmitter, FocusHandle, InteractiveElement, IntoElement, ParentElement,
-    Pixels, Render, RenderImage, SharedString, Styled, UTF16Selection, Window,
+    Pixels, Point, Render, RenderImage, SharedString, Styled, UTF16Selection, Window,
 };
 
 mod buffer;
@@ -158,6 +159,16 @@ pub struct MarkdownEditor {
     /// While dragging the scrollbar thumb: the grab point's offset from the
     /// thumb's top, so the thumb follows the pointer 1:1.
     pub(crate) scrollbar_drag: Option<Pixels>,
+    /// While drag-selecting with the pointer outside the text area: the pointer
+    /// in *content-box* coordinates, so y is negative above the viewport and
+    /// greater than `viewport_height` below it. A repeating task scrolls from
+    /// this and re-hit-tests the selection end, which is what lets a selection
+    /// grow past the visible page while the pointer is held still.
+    autoscroll: Option<Point<Pixels>>,
+    /// Generation of the running autoscroll loop, so a loop left over from an
+    /// earlier drag exits instead of double-scrolling alongside the new one.
+    /// (A cancel-on-drop `Task` can't be dropped from inside its own tick.)
+    autoscroll_gen: u64,
     /// Pointer is over the scrollbar strip (or dragging it) — drawn brighter.
     pub(crate) scrollbar_hover: bool,
     pub(crate) layout: Option<Rc<Layout>>, // last painted layout, for movement + hit-testing
@@ -197,7 +208,7 @@ impl MarkdownEditor {
         ensure_fonts(cx);
         bind_default_keys(cx);
         let text: String = content.into();
-        Self {
+        let mut this = Self {
             buffer: Buffer::new(&text),
             text,
             cursor: 0,
@@ -211,6 +222,8 @@ impl MarkdownEditor {
             scroll_track: px(0.),
             scrollbar_drag: None,
             scrollbar_hover: false,
+            autoscroll: None,
+            autoscroll_gen: 0,
             layout: None,
             focus_handle,
             base_dir,
@@ -224,7 +237,9 @@ impl MarkdownEditor {
             shaped_range: 0..0,
             shapes: ShapeCaches::default(),
             table_menu: None,
-        }
+        };
+        this.maybe_drag_test(cx);
+        this
     }
 
     /// Refresh the `text` cache from the buffer after a mutation.
@@ -558,6 +573,105 @@ impl MarkdownEditor {
             self.scroll_top,
             self.scroll_track,
         )
+    }
+
+    /// Point drag-autoscroll at `pos` (the pointer, in content-box coordinates),
+    /// or stop it with `None`. Starting it spawns a loop that keeps scrolling
+    /// until the pointer comes back inside, the button is released, or the view
+    /// goes away; calling it again while it runs only updates the target.
+    pub(crate) fn set_autoscroll(&mut self, pos: Option<Point<Pixels>>, cx: &mut Context<Self>) {
+        let start = pos.is_some() && self.autoscroll.is_none();
+        self.autoscroll = pos;
+        if !start {
+            return;
+        }
+        self.autoscroll_gen = self.autoscroll_gen.wrapping_add(1);
+        let generation = self.autoscroll_gen;
+        cx.spawn(async move |this, cx| {
+            loop {
+                cx.background_executor().timer(AUTOSCROLL_TICK).await;
+                let go = this
+                    .update(cx, |e, cx| {
+                        e.autoscroll_gen == generation && e.autoscroll_tick(cx)
+                    })
+                    .unwrap_or(false); // the view was dropped
+                if !go {
+                    break;
+                }
+            }
+        })
+        .detach();
+    }
+
+    /// Test hatch: with `SLIMNOTES_DRAG_TEST=1`, park a simulated text drag below
+    /// the text area shortly after the window opens and log the scroll offset and
+    /// selection as it runs. There is no mouse injection in this dev setup, so
+    /// this is the only way to exercise autoscroll end to end — the tick loop,
+    /// the repaint, and the hit-test that grows the selection — rather than just
+    /// the [`drag_scroll_step`] ramp its unit tests cover.
+    fn maybe_drag_test(&mut self, cx: &mut Context<Self>) {
+        if std::env::var_os("SLIMNOTES_DRAG_TEST").is_none() {
+            return;
+        }
+        cx.spawn(async move |this, cx| {
+            // Let the first frame land, so there is a layout to hit-test against.
+            cx.background_executor().timer(Duration::from_millis(1200)).await;
+            this.update(cx, |e, cx| {
+                e.cursor = 0;
+                e.anchor = Some(0);
+                e.dragging = true;
+                let below = point(px(40.), e.viewport_height + px(120.));
+                e.set_autoscroll(Some(below), cx);
+            })
+            .ok();
+            for _ in 0..8 {
+                cx.background_executor().timer(Duration::from_millis(250)).await;
+                this.update(cx, |e, _| {
+                    eprintln!(
+                        "drag-test: scroll_top={} selection={}..{}",
+                        f32::from(e.scroll_top),
+                        e.anchor.unwrap_or(0),
+                        e.cursor
+                    );
+                })
+                .ok();
+            }
+            this.update(cx, |e, cx| {
+                e.dragging = false;
+                e.set_autoscroll(None, cx);
+            })
+            .ok();
+        })
+        .detach();
+    }
+
+    /// One autoscroll frame: scroll by the ramped step, then extend the selection
+    /// to whatever the pointer now points at — the pointer hasn't moved, the text
+    /// under it has. Returns whether to keep ticking.
+    fn autoscroll_tick(&mut self, cx: &mut Context<Self>) -> bool {
+        let Some(pos) = self.autoscroll else { return false };
+        if !self.dragging {
+            self.autoscroll = None; // button released without a mouse-up here
+            return false;
+        }
+        let step = drag_scroll_step(pos.y, self.viewport_height);
+        let max = max_scroll(self.total_height(), self.viewport_height);
+        let scrolled = (self.scroll_top + step).clamp(px(0.), max);
+        let cursor = match self.layout.clone() {
+            Some(layout) => layout.offset_at(pos.x, pos.y + scrolled),
+            None => self.cursor,
+        };
+        // Keep ticking even when nothing moved — at either end of the document
+        // the pointer is still outside, and it may come back or the document may
+        // grow. But don't repaint for a frame that would be identical.
+        if scrolled != self.scroll_top || cursor != self.cursor {
+            self.scroll_top = scrolled;
+            self.cursor = cursor;
+            self.goal_x = None;
+            self.scroll_to_caret = false; // we are the ones choosing the offset
+            cx.notify();
+        }
+        true
     }
 
     /// Total document height as of the last layout (0 before the first one).
@@ -1191,6 +1305,45 @@ mod tests {
         assert_eq!(spans.len(), 2);
         assert_eq!(&line[spans[0].clone()], "`a`");
         assert_eq!(&line[spans[1].clone()], "bb");
+    }
+
+    #[test]
+    fn table_cell_selection_covers_the_whole_cell_or_part_of_it() {
+        // A cell holding document bytes 10..20.
+        let sel = |a: usize, b: usize| cell_selection(10, 20, Some((a, b)));
+        // Untouched: entirely before, entirely after, or abutting either edge.
+        assert_eq!(sel(0, 5), None);
+        assert_eq!(sel(0, 10), None);
+        assert_eq!(sel(20, 30), None);
+        assert_eq!(cell_selection(10, 20, None), None);
+        // Exactly the cell, and any selection that swallows it (the common case:
+        // a drag across several rows) fills the box.
+        assert_eq!(sel(10, 20), Some(CellSel::Whole));
+        assert_eq!(sel(0, 999), Some(CellSel::Whole));
+        // Partial covers are reported cell-local, ready for `src_to_disp`.
+        assert_eq!(sel(12, 15), Some(CellSel::Part(2..5)));
+        assert_eq!(sel(0, 13), Some(CellSel::Part(0..3)));
+        assert_eq!(sel(17, 99), Some(CellSel::Part(7..10)));
+    }
+
+    #[test]
+    fn empty_table_cell_still_selects() {
+        // A blank cell has no text to highlight, but a selection running through
+        // the row must not leave a hole in it.
+        assert_eq!(cell_selection(10, 10, Some((0, 99))), Some(CellSel::Whole));
+        assert_eq!(cell_selection(10, 10, Some((10, 20))), Some(CellSel::Whole));
+        // Merely ending at the cell doesn't select it, and neither does starting
+        // after it.
+        assert_eq!(cell_selection(10, 10, Some((0, 10))), None);
+        assert_eq!(cell_selection(10, 10, Some((11, 20))), None);
+    }
+
+    #[test]
+    fn a_caret_in_a_cell_is_not_a_selection() {
+        // `selection()` never yields a collapsed range, but the helper must not
+        // depend on that: an empty range would otherwise paint a stray sliver.
+        assert_eq!(cell_selection(10, 20, Some((15, 15))), None);
+        assert_eq!(cell_selection(10, 10, Some((10, 10))), None);
     }
 
     #[test]

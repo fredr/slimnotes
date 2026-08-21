@@ -68,6 +68,43 @@ impl TableCell {
     }
 }
 
+/// What a selection covers of one table cell.
+#[derive(Clone, Debug, PartialEq)]
+pub(crate) enum CellSel {
+    /// The whole cell: fill its box, so a row (or a whole table) inside the
+    /// selection reads as one continuous band rather than scattered word
+    /// highlights over the cell text.
+    Whole,
+    /// Part of the cell's text, as a *cell-local* source byte range (i.e.
+    /// relative to [`TableCell::src_start`], ready for `src_to_disp`).
+    Part(Range<usize>),
+}
+
+/// How `sel` (a document byte range) covers the cell spanning `cs..ce`.
+///
+/// Kept separate from painting so the cases can be tested without a shaped
+/// line: a cell is only involved if the selection reaches into it, and an
+/// *empty* cell counts as covered when the selection passes through its
+/// position — otherwise a selected row would have holes where cells are blank.
+pub(crate) fn cell_selection(
+    cs: usize,
+    ce: usize,
+    sel: Option<(usize, usize)>,
+) -> Option<CellSel> {
+    let (ss, se) = sel?;
+    if ss >= se {
+        return None; // a collapsed range is a caret, not a selection
+    }
+    let touches = if cs == ce { ss <= cs && se > cs } else { se > cs && ss < ce };
+    if !touches {
+        return None;
+    }
+    if ss <= cs && se >= ce {
+        return Some(CellSel::Whole);
+    }
+    Some(CellSel::Part(ss.max(cs) - cs..se.min(ce) - cs))
+}
+
 /// How a source line participates in a rendered table.
 #[derive(Clone)]
 pub(crate) enum TableRender {

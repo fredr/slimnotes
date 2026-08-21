@@ -1,4 +1,5 @@
-//! The overlay scrollbar: geometry and the drag mapping that moves it.
+//! Scrolling geometry: the overlay scrollbar (and the drag mapping that moves
+//! it), plus the autoscroll ramp used when a text drag leaves the viewport.
 //!
 //! Pure functions over (total height, viewport height, scroll offset, track
 //! length), so the painted thumb and the drag that scrolls by it can never
@@ -13,6 +14,8 @@
 //! `total` comes from the layout's exact `total_height` — virtualization
 //! measures every line's height even when it defers shaping, so the thumb is
 //! correctly sized from the first frame and doesn't drift as you scroll.
+
+use std::time::Duration;
 
 use gpui::{px, Bounds, Pixels, Point};
 
@@ -98,6 +101,40 @@ pub(crate) fn scroll_for_thumb_top(
         return px(0.);
     }
     px((f32::from(thumb_top) / travel).clamp(0., 1.) * (t - v))
+}
+
+/// How often the drag-autoscroll loop ticks (~60Hz), which is what makes the
+/// `AUTOSCROLL_*` steps below a speed rather than a distance.
+pub(crate) const AUTOSCROLL_TICK: Duration = Duration::from_millis(16);
+/// How far past the viewport edge the pointer must be for autoscroll to reach
+/// full speed.
+const AUTOSCROLL_RAMP: f32 = 160.0;
+/// Step just past the edge — slow enough to place the end of a selection
+/// precisely (~90 px/s).
+const AUTOSCROLL_MIN: f32 = 1.5;
+/// Step at full ramp (~1440 px/s), fast enough to cross a long note.
+const AUTOSCROLL_MAX: f32 = 24.0;
+
+/// How far to scroll in one autoscroll tick while drag-selecting, given the
+/// pointer's y in *content-box* coordinates: negative to scroll up (the pointer
+/// is above the viewport), positive to scroll down, zero while it is inside.
+///
+/// A function of position only, never of movement: that is precisely what lets
+/// the caller keep scrolling while the pointer is held still outside the text,
+/// which is the behaviour that makes selecting past the visible page possible.
+/// The speed ramps with the overshoot so a small overshoot creeps and a big one
+/// travels.
+pub(crate) fn drag_scroll_step(y: Pixels, viewport: Pixels) -> Pixels {
+    let (y, v) = (f32::from(y), f32::from(viewport));
+    let over = if y < 0. {
+        y
+    } else if y > v {
+        y - v
+    } else {
+        return px(0.);
+    };
+    let t = (over.abs() / AUTOSCROLL_RAMP).min(1.);
+    px(over.signum() * (AUTOSCROLL_MIN + (AUTOSCROLL_MAX - AUTOSCROLL_MIN) * t))
 }
 
 #[cfg(test)]
@@ -248,6 +285,55 @@ mod tests {
         assert!(!at(895., 10.));
         assert!(!at(895., 700.));
         assert!(!at(950., 300.));
+    }
+
+    #[test]
+    fn no_autoscroll_while_the_pointer_is_inside() {
+        let v = px(500.);
+        for y in [0., 1., 250., 499., 500.] {
+            assert_eq!(f(drag_scroll_step(px(y), v)), 0., "y={y} should not scroll");
+        }
+    }
+
+    #[test]
+    fn autoscroll_direction_follows_the_edge_crossed() {
+        let v = px(500.);
+        // Above the text: scroll up (towards the start of the document).
+        assert!(f(drag_scroll_step(px(-1.), v)) < 0.);
+        assert!(f(drag_scroll_step(px(-300.), v)) < 0.);
+        // Below it: scroll down.
+        assert!(f(drag_scroll_step(px(501.), v)) > 0.);
+        assert!(f(drag_scroll_step(px(900.), v)) > 0.);
+    }
+
+    #[test]
+    fn autoscroll_ramps_with_the_overshoot_and_caps() {
+        let v = px(500.);
+        // A hair past the edge creeps, so the selection end is placeable.
+        assert!((f(drag_scroll_step(px(500.5), v)) - AUTOSCROLL_MIN).abs() < 0.2);
+        // Monotonic in the overshoot...
+        let mut prev = 0.;
+        for over in [1., 20., 60., 100., 159.] {
+            let s = f(drag_scroll_step(px(500. + over), v));
+            assert!(s > prev, "not monotonic at {over}: {s} <= {prev}");
+            prev = s;
+        }
+        // ...and capped, so a pointer flung far off screen doesn't teleport.
+        assert_eq!(f(drag_scroll_step(px(500. + AUTOSCROLL_RAMP), v)), AUTOSCROLL_MAX);
+        assert_eq!(f(drag_scroll_step(px(99_999.), v)), AUTOSCROLL_MAX);
+        assert_eq!(f(drag_scroll_step(px(-99_999.), v)), -AUTOSCROLL_MAX);
+    }
+
+    #[test]
+    fn autoscroll_depends_only_on_position() {
+        // The property the held-still case relies on: the same pointer position
+        // always yields the same step, so the loop keeps scrolling with no
+        // further mouse movement.
+        let v = px(500.);
+        let a = drag_scroll_step(px(560.), v);
+        let b = drag_scroll_step(px(560.), v);
+        assert_eq!(a, b);
+        assert!(f(a) > 0.);
     }
 
     #[test]

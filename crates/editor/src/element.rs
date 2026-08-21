@@ -1200,6 +1200,38 @@ impl Element for EditorElement {
                     // paint_background draws inline code/highlight run backgrounds
                     // (ShapedLine::paint only draws glyphs).
                     let _ = cell.shaped.paint_background(text_origin, line.line_height, window, cx);
+                    // Selection. A table row has no `wrapped` line of its own —
+                    // every cell is separately shaped — so the `paint_selection`
+                    // above cannot draw it; each cell highlights itself here.
+                    // After the run backgrounds (which are opaque) so selected
+                    // inline code still reads as selected, and before the glyphs.
+                    match cell_selection(cell.src_start, cell.src_end, prepaint.selection) {
+                        Some(CellSel::Whole) => {
+                            // Inset by the border so the grid stays visible
+                            // through the band, which is what makes a
+                            // multi-row selection still look like a table.
+                            let rect = Bounds {
+                                origin: point(cx0 + px(1.), screen_top + px(1.)),
+                                size: size(
+                                    (cell.width - px(2.)).max(px(0.)),
+                                    (line.height - px(2.)).max(px(0.)),
+                                ),
+                            };
+                            window.paint_quad(fill(rect, rgb(SELECTION)));
+                        }
+                        Some(CellSel::Part(r)) => {
+                            let a = src_to_disp(&cell.segs, r.start);
+                            let b = src_to_disp(&cell.segs, r.end);
+                            let x0 = cell.shaped.x_for_index(a);
+                            let x1 = cell.shaped.x_for_index(b);
+                            let rect = Bounds {
+                                origin: point(text_origin.x + x0, screen_top + px(1.)),
+                                size: size((x1 - x0).max(px(3.)), (line.height - px(2.)).max(px(0.))),
+                            };
+                            window.paint_quad(fill(rect, rgb(SELECTION)));
+                        }
+                        None => {}
+                    }
                     let _ = cell.shaped.paint(text_origin, line.line_height, window, cx);
                 }
                 continue;
@@ -1437,7 +1469,19 @@ impl Element for EditorElement {
         window.on_mouse_event({
             let editor = self.editor.clone();
             move |ev: &MouseMoveEvent, phase, _window, cx| {
-                if phase != DispatchPhase::Bubble || ev.pressed_button != Some(MouseButton::Left) {
+                if phase != DispatchPhase::Bubble {
+                    return;
+                }
+                if ev.pressed_button != Some(MouseButton::Left) {
+                    // The button came up somewhere we never saw it (released
+                    // outside the window, say). End the drag here rather than
+                    // leave it live — otherwise autoscroll would keep running.
+                    editor.update(cx, |e, cx| {
+                        if e.dragging {
+                            e.dragging = false;
+                            e.set_autoscroll(None, cx);
+                        }
+                    });
                     return;
                 }
                 editor.update(cx, |e, cx| {
@@ -1445,8 +1489,22 @@ impl Element for EditorElement {
                         return;
                     }
                     let Some(layout) = e.layout.clone() else { return };
-                    let content_y = ev.position.y - content.origin.y + e.scroll_top;
-                    e.cursor = layout.offset_at(ev.position.x - content.origin.x, content_y);
+                    let local = point(
+                        ev.position.x - content.origin.x,
+                        ev.position.y - content.origin.y,
+                    );
+                    // Dragging past the top or bottom of the text keeps scrolling
+                    // for as long as the pointer stays there, so a selection can
+                    // run past the visible page. The trigger zone starts at the
+                    // *content* edge — inside the window by CONTENT_PAD — so it
+                    // engages before the pointer leaves the window at all, and
+                    // doesn't depend on motion events still arriving from outside.
+                    if drag_scroll_step(local.y, e.viewport_height) != px(0.) {
+                        e.set_autoscroll(Some(local), cx);
+                    } else {
+                        e.set_autoscroll(None, cx);
+                    }
+                    e.cursor = layout.offset_at(local.x, local.y + e.scroll_top);
                     e.goal_x = None;
                     cx.notify();
                 });
@@ -1460,6 +1518,7 @@ impl Element for EditorElement {
                 }
                 editor.update(cx, |e, cx| {
                     e.dragging = false;
+                    e.set_autoscroll(None, cx); // stop scrolling on release
                     if e.scrollbar_drag.take().is_some() {
                         cx.notify(); // the thumb goes back to its idle shade
                     }
