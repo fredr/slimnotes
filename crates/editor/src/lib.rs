@@ -753,21 +753,11 @@ impl MarkdownEditor {
     pub(crate) fn checkbox_hit(&self, x: Pixels, content_y: Pixels) -> Option<usize> {
         let layout = self.layout.as_ref()?;
         let l = layout.line_at_y(content_y)?;
-        // Only a shaped (i.e. visible) line has glyph positions to hit-test.
-        let wrapped = l.wrapped.as_ref()?;
         let local_y = content_y - l.top;
+        // `check_rect` yields nothing for an unshaped line, which has no glyph
+        // positions — and is off-screen anyway, so it can't be clicked.
         for c in &l.checks {
-            let p0 = wrapped
-                .position_for_index(c.disp.start, l.line_height)
-                .unwrap_or_default();
-            let p1 = wrapped
-                .position_for_index(c.disp.end, l.line_height)
-                .unwrap_or(p0);
-            if local_y >= p0.y
-                && local_y < p0.y + l.line_height
-                && x >= p0.x - px(3.)
-                && x <= p1.x + px(4.)
-            {
+            if l.check_rect(c).is_some_and(|r| r.contains(&point(x, local_y))) {
                 return Some(c.inner_abs);
             }
         }
@@ -977,6 +967,10 @@ impl MarkdownEditor {
                 div()
                     .w(px(TABLE_MENU_W))
                     .py(px(TABLE_MENU_VPAD))
+                    // On the whole panel, not just the items: otherwise the
+                    // text's I-beam would show through the padding strips at
+                    // the top and bottom of the menu.
+                    .cursor_pointer()
                     .bg(rgb(0x262626))
                     .border_1()
                     .border_color(rgb(0x3a3a3a))

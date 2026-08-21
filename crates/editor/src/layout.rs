@@ -4,7 +4,7 @@
 use std::ops::Range;
 use std::sync::Arc;
 
-use gpui::{point, px, Pixels, RenderImage, Size, WrappedLine};
+use gpui::{point, px, size, Bounds, Pixels, RenderImage, Size, WrappedLine};
 
 use crate::*;
 
@@ -48,6 +48,24 @@ pub(crate) struct ShapeIn {
 }
 
 impl VisualLine {
+    /// The clickable rect of one checkbox, in line-local coordinates (x from the
+    /// content left edge, y from this line's top). Deliberately a little larger
+    /// than the painted box — it is a small target — and shared by the click
+    /// hit-test and the pointer shape, so what looks clickable is clickable.
+    ///
+    /// `None` for an unshaped line, which has no glyph positions.
+    pub(crate) fn check_rect(&self, chk: &CheckHit) -> Option<Bounds<Pixels>> {
+        let wrapped = self.wrapped.as_ref()?;
+        let p0 = wrapped.position_for_index(chk.disp.start, self.line_height)?;
+        let p1 = wrapped
+            .position_for_index(chk.disp.end, self.line_height)
+            .unwrap_or(p0);
+        Some(Bounds {
+            origin: point(p0.x - px(3.), p0.y),
+            size: size(p1.x + px(4.) - (p0.x - px(3.)), self.line_height),
+        })
+    }
+
     /// Total x-offset for a point at local y: the whole-line inset plus, for
     /// wrapped continuation rows of a list item, the hanging indent.
     pub(crate) fn x_offset(&self, local_y: Pixels) -> Pixels {
@@ -71,6 +89,98 @@ pub(crate) struct Layout {
 }
 
 impl Layout {
+    /// Content-space rects of everything a left click *acts on* rather than
+    /// placing the caret: rendered links and checkbox slots. The pointer turns
+    /// into a hand over these (see `element::paint`), so the shape always
+    /// promises exactly what the click handlers deliver.
+    ///
+    /// Restricted to `visible` (a content-space y range) since off-screen lines
+    /// are unshaped and have no geometry, and there is nothing to hover anyway.
+    pub(crate) fn clickable_rects(
+        &self,
+        visible: Range<Pixels>,
+        cursor: usize,
+    ) -> Vec<Bounds<Pixels>> {
+        let mut out = Vec::new();
+        // Binary-search the visible slice rather than scanning the document —
+        // this runs every prepaint, and a linear pass would give back what
+        // virtualization bought.
+        let (Some(first), Some(last)) = (
+            self.line_index_at_y(visible.start),
+            self.line_index_at_y(visible.end),
+        ) else {
+            return out;
+        };
+        let on_screen =
+            |l: &VisualLine| l.top + l.height >= visible.start && l.top <= visible.end;
+
+        for l in &self.lines[first..=last] {
+            for c in &l.checks {
+                if let Some(r) = l.check_rect(c) {
+                    out.push(Bounds {
+                        origin: point(r.origin.x, l.top + r.origin.y),
+                        size: r.size,
+                    });
+                }
+            }
+        }
+
+        // Links are only clickable while the caret is elsewhere: on the caret's
+        // own line the raw source shows and a click edits it instead of opening
+        // the link, so that line must not offer a hand (see the mouse handler).
+        let caret_line = self.line_index_at_offset(cursor);
+        // Source range spanned by the visible lines, so a link elsewhere in the
+        // document is rejected by two comparisons instead of a binary search.
+        let seen = self.lines[first].start
+            ..self.lines[last].start + self.lines[last].source.len();
+        for (src, _) in self.links.iter() {
+            if src.start < seen.start || src.start >= seen.end {
+                continue;
+            }
+            let Some(li) = self.line_index_at_offset(src.start) else { continue };
+            if Some(li) == caret_line {
+                continue;
+            }
+            let l = &self.lines[li];
+            if !on_screen(l) {
+                continue;
+            }
+            let Some(wrapped) = l.wrapped.as_ref() else { continue };
+            let line_end = l.start + l.source.len();
+            if src.start < l.start || src.start >= line_end {
+                continue;
+            }
+            let lh = l.line_height;
+            let a = src_to_disp(&l.segs, src.start - l.start);
+            let b = src_to_disp(&l.segs, src.end.min(line_end) - l.start);
+            let Some(pa) = wrapped.position_for_index(a, lh) else { continue };
+            let pb = wrapped.position_for_index(b, lh).unwrap_or(pa);
+            let full_w = wrapped.size(lh).width;
+            let mut row = |x0: Pixels, x1: Pixels, y: Pixels| {
+                if x1 > x0 {
+                    out.push(Bounds {
+                        origin: point(x0 + l.x_offset(y), l.top + y),
+                        size: size(x1 - x0, lh),
+                    });
+                }
+            };
+            // A link normally sits on one row; a long one can wrap, so cover
+            // each row it spans.
+            if pa.y == pb.y {
+                row(pa.x, pb.x, pa.y);
+            } else {
+                row(pa.x, full_w, pa.y);
+                let mut y = pa.y + lh;
+                while y + px(0.5) < pb.y {
+                    row(px(0.), full_w, y);
+                    y += lh;
+                }
+                row(px(0.), pb.x, pb.y);
+            }
+        }
+        out
+    }
+
     /// The link target whose source range contains `offset`, if any.
     pub(crate) fn link_at(&self, offset: usize) -> Option<LinkTarget> {
         self.links

@@ -6,10 +6,10 @@ use std::rc::Rc;
 
 use gpui::{
     fill, point, px, quad, relative, rgb, rgba, size, transparent_black, App, BorderStyle, Bounds,
-    ContentMask, Corners, DispatchPhase, Element, ElementId, ElementInputHandler, Entity,
-    FontWeight, GlobalElementId, InspectorElementId, IntoElement, LayoutId, MouseButton,
-    MouseDownEvent, MouseMoveEvent, MouseUpEvent, Pixels, ScrollDelta, ScrollWheelEvent,
-    SharedString, Style, TextAlign, TextRun, WrappedLine, Window,
+    ContentMask, Corners, CursorStyle, DispatchPhase, Element, ElementId, ElementInputHandler,
+    Entity, FontWeight, GlobalElementId, Hitbox, HitboxBehavior, InspectorElementId, IntoElement,
+    LayoutId, MouseButton, MouseDownEvent, MouseMoveEvent, MouseUpEvent, Pixels, ScrollDelta,
+    ScrollWheelEvent, SharedString, Style, TextAlign, TextRun, WrappedLine, Window,
 };
 
 use crate::*;
@@ -318,6 +318,11 @@ pub(crate) struct Prepaint {
     selection: Option<(usize, usize)>,
     /// The IME preedit range, underlined while composing.
     marked: Option<(usize, usize)>,
+    /// Where a click places the caret — the text plus its margins. Gets the
+    /// I-beam pointer.
+    hitbox: Hitbox,
+    /// Links and checkboxes: clicking acts on them, so they get a hand pointer.
+    hands: Vec<Hitbox>,
 }
 
 impl IntoElement for EditorElement {
@@ -329,18 +334,21 @@ impl IntoElement for EditorElement {
 
 impl EditorElement {
     /// Finish a prepaint: clamp scroll (keeping the caret in view), persist it,
-    /// and package the state for `paint`. Shared by the cache-hit and rebuild
-    /// paths so both handle scrolling identically.
+    /// insert the pointer hitboxes, and package the state for `paint`. Shared by
+    /// the cache-hit and rebuild paths so both handle scrolling identically.
     fn finish(
         &mut self,
         layout: Rc<Layout>,
         scroll_top: Pixels,
-        viewport_height: Pixels,
-        scroll_track: Pixels,
+        bounds: Bounds<Pixels>,
         cursor: usize,
         selection: Option<(usize, usize)>,
+        window: &mut Window,
         cx: &mut App,
     ) -> Prepaint {
+        let content = content_rect(bounds);
+        let viewport_height = content.size.height;
+        let scroll_track = bounds.size.height;
         let marked = self.editor.update(cx, |e, _| {
             e.scroll_top = scroll_top;
             e.scroll_to_caret = false;
@@ -352,12 +360,48 @@ impl EditorElement {
             e.scroll_track = scroll_track;
             e.marked_range.as_ref().map(|r| (r.start, r.end))
         });
+        // Pointer regions. Hitboxes may only be created during prepaint, and
+        // `scroll_top` is final by the time we get here, so this is the only
+        // correct place for them. Everywhere a click places the caret gets an
+        // I-beam; links and checkboxes get a hand over the top of it (`paint`).
+        //
+        // That is the text *and its margins*, minus the scrollbar strip — and
+        // only while a scrollbar is actually shown, which is exactly the
+        // condition the mouse-down handler uses to ignore a press there.
+        let strip = scrollbar_geom(layout.total_height, viewport_height, scroll_top, scroll_track)
+            .map_or(px(0.), |_| px(SCROLLBAR_HIT_W));
+        let caret_area = Bounds {
+            origin: bounds.origin,
+            size: size((bounds.size.width - strip).max(px(0.)), bounds.size.height),
+        };
+        let hitbox = window.insert_hitbox(caret_area, HitboxBehavior::Normal);
+        let visible = scroll_top..scroll_top + viewport_height;
+        let hands = layout
+            .clickable_rects(visible, cursor)
+            .into_iter()
+            .filter_map(|r| {
+                // To screen space, then clipped to the text area so a region
+                // half-scrolled off the edge doesn't reach into the margin.
+                let screen = Bounds {
+                    origin: point(
+                        content.origin.x + r.origin.x,
+                        content.origin.y - scroll_top + r.origin.y,
+                    ),
+                    size: r.size,
+                };
+                let clipped = screen.intersect(&content);
+                (clipped.size.width > px(0.) && clipped.size.height > px(0.))
+                    .then(|| window.insert_hitbox(clipped, HitboxBehavior::Normal))
+            })
+            .collect();
         Prepaint {
             layout,
             scroll_top,
             cursor,
             selection,
             marked,
+            hitbox,
+            hands,
         }
     }
 
@@ -784,7 +828,6 @@ impl Element for EditorElement {
         let content = content_rect(bounds);
         let wrap_width = content.size.width.max(px(80.));
         let viewport_height = content.size.height;
-        let scroll_track = bounds.size.height;
         let sig = LayoutSig { version, width: f32::from(wrap_width).to_bits() };
         let reveal = Reveal { cursor, sel: selection };
 
@@ -824,10 +867,10 @@ impl Element for EditorElement {
             return self.finish(
                 layout,
                 scroll_top,
-                viewport_height,
-                scroll_track,
+                bounds,
                 cursor,
                 selection,
+                window,
                 cx,
             );
         }
@@ -932,10 +975,10 @@ impl Element for EditorElement {
                 return self.finish(
                 layout,
                 scroll_top,
-                viewport_height,
-                scroll_track,
+                bounds,
                 cursor,
                 selection,
+                window,
                 cx,
             );
             }
@@ -1030,10 +1073,10 @@ impl Element for EditorElement {
         self.finish(
                 layout,
                 scroll_top,
-                viewport_height,
-                scroll_track,
+                bounds,
                 cursor,
                 selection,
+                window,
                 cx,
             )
     }
@@ -1062,6 +1105,15 @@ impl Element for EditorElement {
             ElementInputHandler::new(content, self.editor.clone()),
             cx,
         );
+
+        // Pointer shapes. An I-beam over the text, as in any text editor, scoped
+        // to the text area — the margins and the scrollbar strip keep the arrow.
+        // Then a hand over links and checkboxes: requests are resolved
+        // last-one-wins, so these override the I-beam where they overlap.
+        window.set_cursor_style(CursorStyle::IBeam, &prepaint.hitbox);
+        for hand in &prepaint.hands {
+            window.set_cursor_style(CursorStyle::PointingHand, hand);
+        }
 
         let st = prepaint.scroll_top;
         let top_edge = content.origin.y;
@@ -1376,12 +1428,12 @@ impl Element for EditorElement {
         window.on_mouse_event({
             let editor = self.editor.clone();
             move |ev: &MouseDownEvent, phase, window, cx| {
-                // Only the text area places the caret; the surrounding padding and
-                // the scrollbar strip are not text (matching the behavior from when
-                // a padded wrapper div bounded this element).
+                // The whole element, not just the inset text: the padding reads as
+                // part of the page, so clicking it places the caret at the nearest
+                // text position. Only the scrollbar strip is excluded (below).
                 if phase != DispatchPhase::Bubble
                     || ev.button != MouseButton::Left
-                    || !content.contains(&ev.position)
+                    || !bounds.contains(&ev.position)
                 {
                     return;
                 }
@@ -1403,8 +1455,19 @@ impl Element for EditorElement {
                         return;
                     }
                     let Some(layout) = e.layout.clone() else { return };
-                    let x = ev.position.x - content.origin.x;
-                    let content_y = ev.position.y - content.origin.y + e.scroll_top;
+                    // A click in the margins is treated as a click on the nearest
+                    // edge of the text: clamping x/y into the content box lands it
+                    // at the start/end of the nearest visible line.
+                    let x = (ev.position.x - content.origin.x).clamp(px(0.), content.size.width);
+                    let content_y = (ev.position.y - content.origin.y)
+                        .clamp(px(0.), content.size.height)
+                        + e.scroll_top;
+                    // ...but a margin click must not *activate* anything. A
+                    // checkbox at the start of its line sits within a few px of
+                    // the content edge, so a clamped click would land inside its
+                    // (deliberately generous) target and toggle it; likewise for a
+                    // link at a line's start or end.
+                    let on_text = content.contains(&ev.position);
                     e.focus_handle.focus(window);
                     e.goal_x = None; // a click recomputes the goal column next time
                     // Double-click selects the word under the cursor; triple-click
@@ -1426,7 +1489,7 @@ impl Element for EditorElement {
                         return;
                     }
                     // A click on a rendered checkbox toggles it instead of moving the caret.
-                    if !ev.modifiers.shift {
+                    if on_text && !ev.modifiers.shift {
                         if let Some(inner) = e.checkbox_hit(x, content_y) {
                             e.toggle_checkbox(inner);
                             cx.emit(EditorEvent::Changed);
@@ -1438,7 +1501,7 @@ impl Element for EditorElement {
                     let offset = layout.offset_at(x, content_y);
                     // Click a rendered link to open it (unless its line already
                     // shows raw source, i.e. the caret is on it — then edit).
-                    if !ev.modifiers.shift {
+                    if on_text && !ev.modifiers.shift {
                         let clicked_line = offset_to_line_col(&e.text, offset).0;
                         let caret_line = offset_to_line_col(&e.text, e.cursor).0;
                         if clicked_line != caret_line {
