@@ -18,7 +18,9 @@ pub struct Entry {
 }
 
 /// Persisted user settings (stored as JSON in the app config dir).
-#[derive(Serialize, Deserialize, Clone, Debug, Default, PartialEq, Eq)]
+///
+/// `PartialEq` but not `Eq`: `sidebar_width` is a float.
+#[derive(Serialize, Deserialize, Clone, Debug, Default, PartialEq)]
 pub struct Settings {
     /// Absolute path to the currently selected Obsidian vault, if any.
     pub vault: Option<PathBuf>,
@@ -33,4 +35,12 @@ pub struct Settings {
     /// exists is ignored rather than treated as an error.
     #[serde(default)]
     pub last_note: HashMap<String, String>,
+    /// Sidebar width in pixels. Not per-vault: the sidebar is a property of the
+    /// window, and a user who has sized it once means it for the app. `None`
+    /// means "never resized", so the built-in default applies.
+    #[serde(default)]
+    pub sidebar_width: Option<f32>,
+    /// Whether the sidebar is collapsed.
+    #[serde(default)]
+    pub sidebar_collapsed: bool,
 }

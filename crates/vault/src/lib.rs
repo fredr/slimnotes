@@ -14,7 +14,10 @@ mod model;
 mod settings;
 mod watch;
 
-pub use fs::{FileSig, file_sig, read_note, read_tree, write_note};
+pub use fs::{
+    FileSig, create_folder, create_note, file_sig, move_entry, read_note, read_tree, rename_entry,
+    trash_entry, write_note,
+};
 pub use index::VaultIndex;
 pub use model::{Entry, Settings};
 pub use settings::{config_path, load_settings, save_settings};
@@ -199,6 +202,119 @@ mod tests {
     }
 
     #[test]
+    fn create_note_and_folder_refuse_to_clobber() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+
+        create_note(&root.join("New.md")).unwrap();
+        assert_eq!(read_note(&root.join("New.md")).unwrap(), "");
+        // A second create must fail rather than truncate the user's note.
+        touch(&root.join("Taken.md"), "precious");
+        assert_eq!(
+            create_note(&root.join("Taken.md")).unwrap_err().kind(),
+            std::io::ErrorKind::AlreadyExists
+        );
+        assert_eq!(read_note(&root.join("Taken.md")).unwrap(), "precious");
+
+        create_folder(&root.join("Folder")).unwrap();
+        assert!(root.join("Folder").is_dir());
+        // Unlike create_dir_all, a second create is an error.
+        assert_eq!(
+            create_folder(&root.join("Folder")).unwrap_err().kind(),
+            std::io::ErrorKind::AlreadyExists
+        );
+        // A folder name taken by a note is also a collision.
+        assert!(create_folder(&root.join("Taken.md")).is_err());
+    }
+
+    #[test]
+    fn rename_entry_moves_and_refuses_to_overwrite() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        touch(&root.join("Old.md"), "body");
+        touch(&root.join("Other.md"), "other body");
+
+        rename_entry(&root.join("Old.md"), &root.join("New.md")).unwrap();
+        assert!(!root.join("Old.md").exists());
+        assert_eq!(read_note(&root.join("New.md")).unwrap(), "body");
+
+        // Renaming onto an existing note must not destroy it — plain fs::rename
+        // would silently replace it on Unix.
+        let err = rename_entry(&root.join("New.md"), &root.join("Other.md")).unwrap_err();
+        assert_eq!(err.kind(), std::io::ErrorKind::AlreadyExists);
+        assert_eq!(read_note(&root.join("Other.md")).unwrap(), "other body");
+        assert_eq!(read_note(&root.join("New.md")).unwrap(), "body");
+
+        // Renaming to itself is a no-op, not an "already exists" error.
+        rename_entry(&root.join("New.md"), &root.join("New.md")).unwrap();
+        assert_eq!(read_note(&root.join("New.md")).unwrap(), "body");
+
+        // Folders rename with their contents.
+        touch(&root.join("Dir/Nested.md"), "nested");
+        rename_entry(&root.join("Dir"), &root.join("Renamed")).unwrap();
+        assert_eq!(read_note(&root.join("Renamed/Nested.md")).unwrap(), "nested");
+    }
+
+    #[test]
+    fn move_entry_into_folder_and_rejects_moving_into_itself() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        touch(&root.join("Note.md"), "n");
+        mkdir(&root.join("Target"));
+        touch(&root.join("Parent/Child/Deep.md"), "d");
+
+        let moved = move_entry(&root.join("Note.md"), &root.join("Target")).unwrap();
+        assert_eq!(moved, root.join("Target/Note.md"));
+        assert_eq!(read_note(&moved).unwrap(), "n");
+
+        // Moving a folder into its own descendant would detach the subtree.
+        let err = move_entry(&root.join("Parent"), &root.join("Parent/Child")).unwrap_err();
+        assert_eq!(err.kind(), std::io::ErrorKind::InvalidInput);
+        assert!(root.join("Parent/Child/Deep.md").exists());
+        // ...and so would moving it into itself.
+        assert!(move_entry(&root.join("Parent"), &root.join("Parent")).is_err());
+
+        // A name already taken in the destination is an error, not a clobber.
+        touch(&root.join("Note.md"), "different");
+        let err = move_entry(&root.join("Note.md"), &root.join("Target")).unwrap_err();
+        assert_eq!(err.kind(), std::io::ErrorKind::AlreadyExists);
+        assert_eq!(read_note(&root.join("Target/Note.md")).unwrap(), "n");
+    }
+
+    #[test]
+    fn trash_entry_moves_to_dot_trash_and_uniquifies() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        touch(&root.join("Ideas.md"), "first");
+        touch(&root.join("Sub/Ideas.md"), "second");
+        mkdir(&root.join("Folder"));
+
+        let t1 = trash_entry(root, &root.join("Ideas.md")).unwrap();
+        assert_eq!(t1, root.join(".trash/Ideas.md"));
+        assert_eq!(read_note(&t1).unwrap(), "first");
+        assert!(!root.join("Ideas.md").exists());
+
+        // A second note of the same name keeps both, extension preserved.
+        let t2 = trash_entry(root, &root.join("Sub/Ideas.md")).unwrap();
+        assert_eq!(t2, root.join(".trash/Ideas 1.md"));
+        assert_eq!(read_note(&t2).unwrap(), "second");
+
+        // Folders trash too, and have no extension to preserve.
+        assert_eq!(
+            trash_entry(root, &root.join("Folder")).unwrap(),
+            root.join(".trash/Folder")
+        );
+        mkdir(&root.join("Folder"));
+        assert_eq!(
+            trash_entry(root, &root.join("Folder")).unwrap(),
+            root.join(".trash/Folder 1")
+        );
+
+        // Trashed notes are hidden from the tree, so nothing extra to filter.
+        assert!(read_tree(root).iter().all(|e| e.name != ".trash"));
+    }
+
+    #[test]
     fn settings_round_trip() {
         let s = Settings {
             vault: Some(PathBuf::from("/home/user/vault")),
@@ -214,6 +330,8 @@ mod tests {
             )]
             .into_iter()
             .collect(),
+            sidebar_width: Some(280.0),
+            sidebar_collapsed: true,
         };
         let json = serde_json::to_string_pretty(&s).unwrap();
         let back: Settings = serde_json::from_str(&json).unwrap();
@@ -230,6 +348,8 @@ mod tests {
         assert_eq!(s.vault, Some(PathBuf::from("/home/user/vault")));
         assert!(s.expanded_folders.is_empty());
         assert!(s.last_note.is_empty());
+        assert_eq!(s.sidebar_width, None);
+        assert!(!s.sidebar_collapsed);
     }
 
     #[test]
