@@ -208,10 +208,28 @@ mod tests {
             )]
             .into_iter()
             .collect(),
+            last_note: [(
+                "/home/user/vault".to_string(),
+                "/home/user/vault/folder/Note.md".to_string(),
+            )]
+            .into_iter()
+            .collect(),
         };
         let json = serde_json::to_string_pretty(&s).unwrap();
         let back: Settings = serde_json::from_str(&json).unwrap();
         assert_eq!(s, back);
+    }
+
+    /// A settings file written before a field existed must still load: the app
+    /// would otherwise back up the user's settings and reset to defaults on
+    /// upgrade, losing their vault.
+    #[test]
+    fn settings_from_an_older_version_load_with_defaults() {
+        let json = r#"{ "vault": "/home/user/vault" }"#;
+        let s: Settings = serde_json::from_str(json).unwrap();
+        assert_eq!(s.vault, Some(PathBuf::from("/home/user/vault")));
+        assert!(s.expanded_folders.is_empty());
+        assert!(s.last_note.is_empty());
     }
 
     #[test]

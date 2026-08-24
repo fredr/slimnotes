@@ -27,4 +27,10 @@ pub struct Settings {
     /// not listed here (or a vault with no entry) is shown collapsed.
     #[serde(default)]
     pub expanded_folders: HashMap<String, Vec<String>>,
+    /// Per-vault last open note: vault path -> note path, so restarting (or
+    /// switching back to a vault) reopens where the user left off. Keyed the
+    /// same way as `expanded_folders`; an entry naming a note that no longer
+    /// exists is ignored rather than treated as an error.
+    #[serde(default)]
+    pub last_note: HashMap<String, String>,
 }

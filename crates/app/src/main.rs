@@ -25,14 +25,29 @@ const CONTEXT: &str = "SlimNotes";
 // Save the current note.
 actions!(slimnotes, [Save]);
 
+/// The settings key for a vault: its path as a lossy string. Every per-vault
+/// map in [`Settings`] is keyed this way.
+fn vault_key(vault: &Path) -> String {
+    vault.to_string_lossy().into_owned()
+}
+
 /// The set of expanded folder paths saved for `vault` (empty if none saved, so
 /// folders start collapsed).
 fn expanded_for(settings: &Settings, vault: Option<&Path>) -> HashSet<String> {
     vault
-        .map(|v| v.to_string_lossy().into_owned())
+        .map(vault_key)
         .and_then(|v| settings.expanded_folders.get(&v))
         .map(|f| f.iter().cloned().collect())
         .unwrap_or_default()
+}
+
+/// The note to reopen for `vault`: the one open when it was last used, if it is
+/// still a file. A saved note that has since been deleted, renamed, or moved is
+/// skipped silently — reopening it is a convenience, not something the user
+/// asked for, so its absence is not worth a message.
+fn last_note_for(settings: &Settings, vault: Option<&Path>) -> Option<PathBuf> {
+    let path = PathBuf::from(settings.last_note.get(&vault_key(vault?))?);
+    path.is_file().then_some(path)
 }
 
 /// Override gpui-component's default dark palette (near-black / near-white,
@@ -134,7 +149,30 @@ impl SlimNotes {
         // Scan the tree + build the index off the UI thread, and start watching.
         this.reload_vault(cx);
         this.start_watcher(cx);
+        this.restore_last_note(window, cx);
         this
+    }
+
+    /// Reopen the note that was open when this vault was last used. Reading it
+    /// is asynchronous, so this does not delay the window appearing.
+    fn restore_last_note(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if let Some(path) = last_note_for(&self.settings, self.vault.as_deref()) {
+            self.open_note(path, window, cx);
+        }
+    }
+
+    /// Record the open note as this vault's last note, so a restart reopens it.
+    fn remember_note(&mut self) {
+        let (Some(vault), Some(current)) = (self.vault.as_deref(), self.current.as_deref()) else {
+            return;
+        };
+        let note = current.to_string_lossy().into_owned();
+        let previous = self.settings.last_note.insert(vault_key(vault), note.clone());
+        // Only touch the file when the note actually changed: this runs on every
+        // note switch, and rewriting identical settings buys nothing.
+        if previous.as_deref() != Some(note.as_str()) {
+            self.persist_settings();
+        }
     }
 
     /// Rescan the vault tree and rebuild the resolver index on the background
@@ -258,15 +296,15 @@ impl SlimNotes {
         let view = cx.entity();
         cx.spawn_in(window, async move |_, cx| {
             let path = paths.await.ok()?.ok()??.into_iter().next()?;
-            cx.update(|_window, cx| {
-                view.update(cx, |this, cx| this.set_vault(path, cx));
+            cx.update(|window, cx| {
+                view.update(cx, |this, cx| this.set_vault(path, window, cx));
             })
             .ok()
         })
         .detach();
     }
 
-    fn set_vault(&mut self, path: PathBuf, cx: &mut Context<Self>) {
+    fn set_vault(&mut self, path: PathBuf, window: &mut Window, cx: &mut Context<Self>) {
         self.save(cx);
         self.settings.vault = Some(path.clone());
         self.persist_settings();
@@ -279,6 +317,8 @@ impl SlimNotes {
         self.status = None;
         self.reload_vault(cx);
         self.start_watcher(cx);
+        // Switching to a vault lands where the user left it, as on startup.
+        self.restore_last_note(window, cx);
         cx.notify();
     }
 
@@ -453,6 +493,7 @@ impl SlimNotes {
         self.current = Some(path);
         self.open_sig = sig;
         self.status = None;
+        self.remember_note();
         cx.notify();
     }
 
