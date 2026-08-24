@@ -744,6 +744,40 @@ impl EditorElement {
 /// has a `WrappedLine`. This never changes a line's height: a deferred line was
 /// proven to fit one row, and shaping it yields exactly that one row — which is
 /// what keeps `total_height` and the scroll geometry stable as you scroll.
+/// Whether a line drawn at `screen_top` with `height` shows any of itself
+/// between `top`/`bottom`.
+///
+/// Those edges must be the **element's**, not the inset text box's: nothing
+/// clips a line to the text box, so a line overlapping the top/bottom padding is
+/// visible in it. Testing against the text box instead made a line paint nothing
+/// for the ~32px it spent crossing the padding and then appear once it reached
+/// the text area, i.e. "text missing until you scroll a bit".
+pub(crate) fn line_on_screen(
+    screen_top: Pixels,
+    height: Pixels,
+    top: Pixels,
+    bottom: Pixels,
+) -> bool {
+    screen_top + height >= top && screen_top <= bottom
+}
+
+/// Whether any line in `range` still needs shaping before it could be painted —
+/// i.e. exactly what [`fill_shapes`] would fill in.
+///
+/// Asked of the layout itself rather than tracked as a "shaped from..to" range.
+/// A summary range cannot express what is actually shaped: the caret's line is
+/// always shaped even when it sits far outside the viewport, so any hull
+/// spanning both claims the lines in between are ready when they are not — and
+/// an unshaped line paints blank. (That was a real bug: jump down the scrollbar
+/// with the caret left at the top, then scroll back slightly, and a screenful of
+/// text vanished until you scrolled far enough to force a refill.)
+pub(crate) fn missing_shapes(lines: &[VisualLine], range: Range<usize>) -> bool {
+    let n = lines.len();
+    lines[range.start.min(n)..range.end.min(n)]
+        .iter()
+        .any(|l| l.wrapped.is_none() && l.shape_in.is_some())
+}
+
 fn fill_shapes(
     lines: &mut [VisualLine],
     range: Range<usize>,
@@ -847,10 +881,8 @@ impl Element for EditorElement {
                 resolve_scroll(&layout, scroll_top, scroll_to_caret, cursor, viewport_height);
             let caret_line = layout.line_index_at_offset(cursor).unwrap_or(0);
             let want = shape_window(&layout.lines, scroll_top, viewport_height);
-            let need = self.editor.update(cx, |e, _| {
-                let have = e.shaped_range.clone();
-                want.start < have.start || want.end > have.end || !have.contains(&caret_line)
-            });
+            let need = missing_shapes(&layout.lines, want.clone())
+                || missing_shapes(&layout.lines, caret_line..caret_line + 1);
             if need {
                 let mut shaper =
                     Shaper::patching(self.editor.update(cx, |e, _| std::mem::take(&mut e.shapes)));
@@ -861,7 +893,6 @@ impl Element for EditorElement {
                 self.editor.update(cx, |e, _| {
                     e.layout = Some(layout.clone());
                     e.shapes = shapes;
-                    e.shaped_range = want.start.min(caret_line)..want.end.max(caret_line + 1);
                 });
             }
             return self.finish(
@@ -964,13 +995,11 @@ impl Element for EditorElement {
                 let want = shape_window(lines, scroll_top, viewport_height);
                 fill_shapes(lines, want.clone(), &mut shaper, window);
                 fill_shapes(lines, caret_line..caret_line + 1, &mut shaper, window);
-                let shaped_range = want.start.min(caret_line)..want.end.max(caret_line + 1);
                 let shapes = shaper.finish();
                 self.editor.update(cx, |e, _| {
                     e.layout = Some(layout.clone());
                     e.layout_reveal = Some(reveal);
                     e.shapes = shapes;
-                    e.shaped_range = shaped_range;
                 });
                 return self.finish(
                 layout,
@@ -1016,7 +1045,6 @@ impl Element for EditorElement {
         let want = shape_window(&layout.lines, scroll_top, viewport_height);
         fill_shapes(&mut layout.lines, want.clone(), &mut shaper, window);
         fill_shapes(&mut layout.lines, caret_line..caret_line + 1, &mut shaper, window);
-        let shaped_range = want.start.min(caret_line)..want.end.max(caret_line + 1);
 
         // Dump the geometry so a virtualized build can be diffed against
         // `SLIMNOTES_NO_VIRT=1`: identical output proves the deferred heights are
@@ -1068,7 +1096,6 @@ impl Element for EditorElement {
             e.layout_sig = Some(sig);
             e.layout_reveal = Some(reveal);
             e.shapes = shapes;
-            e.shaped_range = shaped_range;
         });
         self.finish(
                 layout,
@@ -1116,12 +1143,23 @@ impl Element for EditorElement {
         }
 
         let st = prepaint.scroll_top;
-        let top_edge = content.origin.y;
-        let bottom_edge = content.origin.y + content.size.height;
+        // Cull against the *window*, not the inset text box. Nothing clips a line
+        // to the content rect, so a line overlapping the top/bottom padding is
+        // genuinely visible there and has to be painted: culling on the content
+        // box made a line paint nothing for the ~32px it spent crossing the
+        // padding, then pop into existence on reaching the text area — text
+        // "missing until you scroll a bit". Straddling lines always drew into the
+        // padding, so this makes the two consistent.
+        let top_edge = bounds.origin.y;
+        let bottom_edge = bounds.origin.y + bounds.size.height;
+        // Debug hatch: report any line that is on screen but was never shaped.
+        // Such a line paints blank, so this turns "text is missing" — which is
+        // easy to miss and hard to attribute — into a loud, greppable signal.
+        let check_shapes = std::env::var_os("SLIMNOTES_CHECK_SHAPES").is_some();
 
         for line in &prepaint.layout.lines {
             let screen_top = content.origin.y - st + line.top;
-            if screen_top + line.height < top_edge || screen_top > bottom_edge {
+            if !line_on_screen(screen_top, line.height, top_edge, bottom_edge) {
                 continue;
             }
 
@@ -1293,11 +1331,45 @@ impl Element for EditorElement {
             }
 
             let lh = line.line_height;
+            // Second invariant: the height a line reserved in the layout must be
+            // the height its shaped text actually occupies. Too small and it
+            // overlaps whatever follows; too large and it leaves a gap. Either
+            // way the deferred-height bound was wrong for this line.
+            if check_shapes && line.image.is_none() {
+                if let Some(w) = line.wrapped.as_ref() {
+                    let shaped_h = w.size(lh).height;
+                    if (f32::from(shaped_h) - f32::from(line.height)).abs() > 0.5 {
+                        eprintln!(
+                            "slimnotes: HEIGHT MISMATCH start={} reserved={:.1} shaped={:.1} lh={:.1}",
+                            line.start,
+                            f32::from(line.height),
+                            f32::from(shaped_h),
+                            f32::from(lh),
+                        );
+                    }
+                }
+            }
             let base_x = content.origin.x + line.left_inset;
             // An unshaped line has nothing to draw. It is off-screen by
             // construction (prepaint shapes the visible window), so this is just
             // belt-and-braces against painting a line we deliberately skipped.
-            let Some(wrapped) = line.wrapped.as_ref() else { continue };
+            let Some(wrapped) = line.wrapped.as_ref() else {
+                // Report *any* on-screen line that would paint nothing, not just
+                // ones that still hold shaping inputs — a line missing both is
+                // exactly as blank, and gating on `shape_in` would hide it.
+                if check_shapes && !line.source.is_empty() {
+                    eprintln!(
+                        "slimnotes: UNSHAPED VISIBLE LINE start={} top={:.1} h={:.1} \
+                         (scroll_top={:.1}, shape_in={})",
+                        line.start,
+                        f32::from(line.top),
+                        f32::from(line.height),
+                        f32::from(st),
+                        u8::from(line.shape_in.is_some()),
+                    );
+                }
+                continue;
+            };
             if line.hang > px(0.) && line.height > lh {
                 // Hanging indent: paint row 0 at the margin, continuation rows
                 // shifted right, using vertical content masks to split them.

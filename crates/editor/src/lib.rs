@@ -187,10 +187,6 @@ pub struct MarkdownEditor {
     // these but the layout is not thrown away when they change — only the lines
     // whose reveal can differ are rebuilt (see `prepaint`'s patch path).
     pub(crate) layout_reveal: Option<Reveal>,
-    /// The source-line range whose shaping is currently filled in. Scrolling
-    /// outside it tops up the shape set (heights are already exact, so this never
-    /// moves anything — see `fill_shapes`).
-    pub(crate) shaped_range: std::ops::Range<usize>,
     pub(crate) shapes: ShapeCaches, // persistent shaped lines + table cells
     pub(crate) table_menu: Option<TableMenu>, // open table cell context menu, if any
 }
@@ -234,7 +230,6 @@ impl MarkdownEditor {
             parsed_version: u64::MAX, // force first parse (buffer.version() starts at 0)
             layout_sig: None,
             layout_reveal: None,
-            shaped_range: 0..0,
             shapes: ShapeCaches::default(),
             table_menu: None,
         };
@@ -1502,6 +1497,75 @@ mod tests {
             Reveal { cursor: old.0, sel: old.1 },
             Reveal { cursor: new.0, sel: new.1 },
         )
+    }
+
+    /// A layout where exactly `shaped` are shaped and the rest are deferred
+    /// (i.e. have shaping inputs waiting), which is the state virtualization
+    /// leaves behind.
+    fn shape_state(n: usize, shaped: &[usize]) -> Layout {
+        let mut layout = geom_layout(&vec![27.; n]);
+        for (i, l) in layout.lines.iter_mut().enumerate() {
+            if shaped.contains(&i) {
+                l.wrapped = Some(gpui::WrappedLine::default());
+            } else {
+                l.shape_in = Some(ShapeIn {
+                    display: SharedString::from(""),
+                    runs: Vec::new(),
+                    font_size: px(18.),
+                    width: px(500.),
+                });
+            }
+        }
+        layout
+    }
+
+    #[test]
+    fn a_line_crossing_the_padding_counts_as_on_screen() {
+        // An element 0..700 whose text box is inset by CONTENT_PAD: 32..668.
+        // Text is not clipped to the text box, so the edges passed here are the
+        // element's — a line inside the padding bands IS visible and must paint.
+        let (top, bottom) = (px(0.), px(700.));
+        let lh = px(27.);
+        // Fully inside the bottom padding band (below the text box, above the
+        // window edge): visible. Culling this was the bug.
+        assert!(line_on_screen(px(675.), lh, top, bottom));
+        // Fully inside the top band (above the text box, below the window top).
+        assert!(line_on_screen(px(5.), lh, top, bottom));
+        // Straddling either edge of the window.
+        assert!(line_on_screen(px(-10.), lh, top, bottom));
+        assert!(line_on_screen(px(695.), lh, top, bottom));
+        // Genuinely off screen, above and below.
+        assert!(!line_on_screen(px(-40.), lh, top, bottom));
+        assert!(!line_on_screen(px(701.), lh, top, bottom));
+        // A tall (wrapped) line whose middle covers the whole window.
+        assert!(line_on_screen(px(-500.), px(2000.), top, bottom));
+    }
+
+    #[test]
+    fn missing_shapes_sees_the_gap_a_range_hull_would_hide() {
+        // The state after jumping the scrollbar far down while the caret stays
+        // at the top: line 0 (the caret's) and 20..25 (the viewport) are shaped,
+        // everything between is still deferred.
+        let l = shape_state(30, &[0, 20, 21, 22, 23, 24]);
+        // The viewport itself is ready...
+        assert!(!missing_shapes(&l.lines, 20..25));
+        assert!(!missing_shapes(&l.lines, 0..1));
+        // ...but the lines between the caret and the viewport are NOT, even
+        // though a "shaped 0..25" hull spanning both would claim they are. That
+        // claim is what made a screenful paint blank after scrolling back up.
+        assert!(missing_shapes(&l.lines, 5..10));
+        assert!(missing_shapes(&l.lines, 0..25));
+        // Out-of-range indices are clamped, never panic.
+        assert!(!missing_shapes(&l.lines, 100..200));
+        assert!(missing_shapes(&l.lines, 25..999));
+    }
+
+    #[test]
+    fn missing_shapes_ignores_lines_that_cannot_be_shaped() {
+        // No shaping inputs (tables, images, rules, blank lines) — nothing to
+        // fill in, so they must not keep triggering re-shaping every frame.
+        let l = geom_layout(&[27., 27., 27.]);
+        assert!(!missing_shapes(&l.lines, 0..3));
     }
 
     #[test]
