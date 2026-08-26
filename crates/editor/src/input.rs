@@ -199,7 +199,7 @@ impl MarkdownEditor {
             MoveDocEndExtend    => false, |this, _c| { let e = this.text.len(); this.set_cursor(e, true) };
             Backspace           => true,  |this, _c| this.backspace();
             Delete              => true,  |this, _c| this.delete_forward();
-            InsertNewline       => true,  |this, _c| this.insert("\n");
+            InsertNewline       => true,  |this, _c| this.insert_newline();
             InsertTab           => true,  |this, _c| this.insert("  ");
             Copy                => false, |this, c| this.copy(c);
             Cut                 => true,  |this, c| this.cut(c);

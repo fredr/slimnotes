@@ -44,6 +44,7 @@ pub(crate) struct Checkbox {
 
 pub(crate) struct ListInfo {
     pub(crate) marker: Range<usize>, // line-local list-marker char range (`-`/`*`/`+`)
+    pub(crate) content: usize,       // first byte after the marker's whitespace
     pub(crate) checkbox: Option<Checkbox>,
 }
 
@@ -363,24 +364,83 @@ pub(crate) fn parse_list_line(line: &str) -> Option<ListInfo> {
     while line[i..].starts_with(' ') {
         i += 1;
     }
-    // `[ ]` / `[x]` immediately after the marker's whitespace, then a space.
-    let checkbox = if line.len() >= i + 4
-        && line.is_char_boundary(i + 3)
-        && &line[i..i + 1] == "["
-        && &line[i + 2..i + 3] == "]"
-        && line[i + 3..].starts_with(' ')
-    {
-        Some(Checkbox {
-            bracket: i..i + 3,
-            checked: line.as_bytes()[i + 1] != b' ',
-        })
-    } else {
-        None
-    };
     Some(ListInfo {
         marker: indent..after_marker,
-        checkbox,
+        content: i,
+        checkbox: task_box(&line[i..]).map(|checked| Checkbox {
+            bracket: i..i + 3,
+            checked,
+        }),
     })
+}
+
+/// A `[ ]` / `[x]` task box at the very start of `rest` (a list item's content),
+/// followed by a space: reports whether it is checked. Compares raw bytes so a
+/// multi-byte char between the brackets can't split a slice mid-character.
+fn task_box(rest: &str) -> Option<bool> {
+    let b = rest.as_bytes();
+    (b.len() >= 4 && b[0] == b'[' && b[2] == b']' && b[3] == b' ').then(|| b[1] != b' ')
+}
+
+/// The edit that pressing Enter with the caret at byte `cursor` should make:
+/// the byte range to replace and the text to put there. On a list item this
+/// continues the list, and on an item that was left empty it clears the line —
+/// ending the list with the same key that extends it. `in_code` suppresses both
+/// (inside a fenced block a leading `- ` is code, not a list).
+///
+/// Kept here, and pure, so the whole behaviour is testable without a window;
+/// see [`MarkdownEditor::insert_newline`] for the caller.
+pub(crate) fn newline_edit(text: &str, cursor: usize, in_code: bool) -> (Range<usize>, String) {
+    let plain = || (cursor..cursor, "\n".to_string());
+    if in_code {
+        return plain();
+    }
+    let (line_idx, col) = offset_to_line_col(text, cursor);
+    let line = line_str(text, line_idx);
+    // No marker, or the caret is still inside one: nothing to carry forward.
+    let Some((prefix_len, next)) = list_prefix(line).filter(|(len, _)| col >= *len) else {
+        return plain();
+    };
+    if line[prefix_len..].trim().is_empty() {
+        // Clear the whole line rather than just the marker: what would be left
+        // of an empty item is invisible trailing whitespace.
+        let start = line_start(text, line_idx);
+        return (start..start + line.len(), String::new());
+    }
+    (cursor..cursor, format!("\n{next}"))
+}
+
+/// A list item's marker: the byte length of the prefix that precedes its
+/// content, and the marker the *next* item should carry — task boxes start out
+/// unchecked and ordered numbers advance, everything else repeats verbatim.
+fn list_prefix(line: &str) -> Option<(usize, String)> {
+    let indent = line.len() - line.trim_start().len();
+    let (content, mut next) = if let Some(info) = parse_list_line(line) {
+        // The spaces after `-`/`*`/`+` are part of the prefix, and are repeated
+        // so an aligned list stays aligned.
+        (info.content, line[..info.content].to_string())
+    } else if let Some(end) = ordered_prefix_len(line) {
+        // `ordered_prefix_len` counts the digits plus a two-byte `. ` / `) `.
+        let digits = &line[indent..end - 2];
+        let delim = &line[end - 2..end - 1];
+        let n = match digits.parse::<u64>() {
+            Ok(n) => n.saturating_add(1).to_string(),
+            // Too many digits to be a real list number; keep it as written
+            // rather than renumbering from nowhere.
+            Err(_) => digits.to_string(),
+        };
+        (end, format!("{}{n}{delim} ", &line[..indent]))
+    } else {
+        return None;
+    };
+
+    match task_box(&line[content..]) {
+        Some(_) => {
+            next.push_str("[ ] ");
+            Some((content + 4, next))
+        }
+        None => Some((content, next)),
+    }
 }
 
 /// Decide how to render a checkbox line given the caret's line-local column

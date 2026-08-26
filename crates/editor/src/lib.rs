@@ -430,6 +430,23 @@ impl MarkdownEditor {
         self.edit(range, s, coalesce);
     }
 
+    /// Enter. On a list item this continues the list — a fresh marker on the
+    /// next line, task boxes unchecked and ordered numbers advanced — and on an
+    /// item left empty it removes the marker instead, so a list can be ended
+    /// with the same key that extends it. Anywhere else it is a plain newline.
+    fn insert_newline(&mut self) {
+        // Replacing a selection is an ordinary edit: the caret's line is about
+        // to be cut in half, so there is no item to carry forward.
+        if self.selection().is_some() {
+            self.insert("\n");
+            return;
+        }
+        let line = offset_to_line_col(&self.text, self.cursor).0;
+        let in_code = self.ensure_parsed().code[line].in_block;
+        let (range, insert) = newline_edit(&self.text, self.cursor, in_code);
+        self.edit(range, &insert, None);
+    }
+
     fn backspace(&mut self) {
         if let Some(sel) = self.selection() {
             self.edit(sel, "", None);
@@ -1405,6 +1422,90 @@ mod tests {
         // Never lands inside the 2-byte 'é'.
         assert!(text.is_char_boundary(word_right(text, 3)));
         assert!(text.is_char_boundary(word_left(text, 7)));
+    }
+
+    /// Press Enter in `before`, where `|` marks the caret, and return the
+    /// document with the caret marked the same way — so each case reads as the
+    /// keystroke it describes.
+    fn enter(before: &str) -> String {
+        enter_in_code(before, false)
+    }
+
+    fn enter_in_code(before: &str, in_code: bool) -> String {
+        let cursor = before.find('|').expect("the caret must be marked with |");
+        let text = before.replacen('|', "", 1);
+        let (range, insert) = newline_edit(&text, cursor, in_code);
+        let mut out = text;
+        // The caret lands past the inserted text, as `Buffer::replace` reports.
+        let caret = range.start + insert.len();
+        out.replace_range(range, &insert);
+        out.insert(caret, '|');
+        out
+    }
+
+    #[test]
+    fn enter_continues_a_list() {
+        assert_eq!(enter("- one|"), "- one\n- |");
+        assert_eq!(enter("* one|"), "* one\n* |");
+        assert_eq!(enter("+ one|"), "+ one\n+ |");
+        // Mid-item: the tail moves to the new item.
+        assert_eq!(enter("- one|two"), "- one\n- |two");
+        // Indentation and any alignment spaces are repeated verbatim.
+        assert_eq!(enter("  - a|"), "  - a\n  - |");
+        assert_eq!(enter("-   a|"), "-   a\n-   |");
+        // A multi-byte char right before the caret is not split.
+        assert_eq!(enter("- é|"), "- é\n- |");
+    }
+
+    #[test]
+    fn enter_continues_a_task_list_unchecked() {
+        assert_eq!(enter("- [ ] todo|"), "- [ ] todo\n- [ ] |");
+        // A done item does not hand its checkmark to the next one.
+        assert_eq!(enter("- [x] done|"), "- [x] done\n- [ ] |");
+        assert_eq!(enter("1. [x] done|"), "1. [x] done\n2. [ ] |");
+        // A bracket run that isn't a task box is ordinary content. This used to
+        // panic: the box test sliced `[..]` without checking char boundaries.
+        assert_eq!(enter("- é] x|"), "- é] x\n- |");
+    }
+
+    #[test]
+    fn enter_advances_ordered_numbering() {
+        assert_eq!(enter("3. c|"), "3. c\n4. |");
+        assert_eq!(enter("1) a|"), "1) a\n2) |");
+        assert_eq!(enter("  9. i|"), "  9. i\n  10. |");
+        // Numbering is not restarted from a number we can't parse.
+        let huge = "1".repeat(40);
+        assert_eq!(enter(&format!("{huge}. x|")), format!("{huge}. x\n{huge}. |"));
+    }
+
+    #[test]
+    fn a_second_enter_removes_the_empty_item() {
+        // The first press left `- ` behind; the second takes it away, leaving a
+        // blank line and no markup to delete by hand.
+        assert_eq!(enter("- one\n- |"), "- one\n|");
+        assert_eq!(enter("- [ ] |"), "|");
+        assert_eq!(enter("2. |"), "|");
+        // Indentation goes with it, and so does invisible trailing whitespace.
+        assert_eq!(enter("  - |"), "|");
+        assert_eq!(enter("-   |"), "|");
+        // A third press is then an ordinary newline.
+        assert_eq!(enter("- one\n|"), "- one\n\n|");
+    }
+
+    #[test]
+    fn enter_is_plain_where_there_is_no_item_to_continue() {
+        assert_eq!(enter("hello|"), "hello\n|");
+        // A marker needs its space before it is a list.
+        assert_eq!(enter("-|"), "-\n|");
+        assert_eq!(enter("1.|"), "1.\n|");
+        // Caret inside the marker: the item moves down whole, un-duplicated.
+        assert_eq!(enter("|- one"), "\n|- one");
+        assert_eq!(enter("-| one"), "-\n| one");
+        // ...but at the content start it splits, leaving an empty item above.
+        assert_eq!(enter("- |one"), "- \n- |one");
+        // Inside a fenced block a leading `-` is code, not a list.
+        assert_eq!(enter_in_code("- one|", true), "- one\n|");
+        assert_eq!(enter_in_code("- |", true), "- \n|");
     }
 
     #[test]
