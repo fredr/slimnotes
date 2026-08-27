@@ -314,6 +314,13 @@ impl MarkdownEditor {
         &self.text
     }
 
+    /// The caret's byte offset. Exposed for demos that drive the editor with
+    /// synthetic keystrokes and check where the caret ends up (see the `keynav`
+    /// example).
+    pub fn cursor(&self) -> usize {
+        self.cursor
+    }
+
     /// Place the caret at a byte offset (clamped to a char boundary). Handy for
     /// tests/demos that want to open with the caret somewhere specific.
     pub fn place_cursor(&mut self, offset: usize) {

@@ -4,7 +4,7 @@
 use std::ops::Range;
 use std::sync::Arc;
 
-use gpui::{point, px, size, Bounds, Pixels, RenderImage, Size, WrappedLine};
+use gpui::{point, px, size, Bounds, Pixels, Point, RenderImage, Size, WrappedLine};
 
 use crate::*;
 
@@ -64,6 +64,39 @@ impl VisualLine {
             origin: point(p0.x - px(3.), p0.y),
             size: size(p1.x + px(4.) - (p0.x - px(3.)), self.line_height),
         })
+    }
+
+    /// Where the caret belongs for display byte `disp`, in line-local
+    /// coordinates — [`Self::check_rect`]'s `position_for_index`, but resolving
+    /// soft-wrap boundaries the other way.
+    ///
+    /// A wrap boundary is one offset with two homes: the end of the row that
+    /// filled up, and the start of the row that follows. gpui always answers
+    /// with the former, and its x is the offset's position in the *unwrapped*
+    /// line — past the wrap width, i.e. off the right edge of the window. That
+    /// stranded the caret: arriving at a wrapped line's column 0 and pressing
+    /// down lands exactly on the first boundary, whose reported row is the one
+    /// the caret came from, so the next `down` recomputes the same offset and
+    /// the caret never leaves the line (it is also drawn out of sight while it
+    /// sits there). Answering with the row start instead puts the caret in
+    /// front of the character at `disp`, which is where that character is
+    /// actually drawn.
+    ///
+    /// `None` for an unshaped line, which has no glyph positions.
+    pub(crate) fn caret_pos(&self, disp: usize) -> Option<Point<Pixels>> {
+        let wrapped = self.wrapped.as_ref()?;
+        // The display index each continuation row starts at, in row order.
+        let row_start = |b: &gpui::WrapBoundary| {
+            Some(wrapped.runs().get(b.run_ix)?.glyphs.get(b.glyph_ix)?.index)
+        };
+        match wrapped
+            .wrap_boundaries()
+            .iter()
+            .position(|b| row_start(b) == Some(disp))
+        {
+            Some(i) => Some(point(px(0.), self.line_height * (i + 1) as f32)),
+            None => wrapped.position_for_index(disp, self.line_height),
+        }
     }
 
     /// Total x-offset for a point at local y: the whole-line inset plus, for
@@ -275,11 +308,7 @@ impl Layout {
         // The caret's line is always shaped (it's in the shape set), so this
         // fallback only covers a caret on a line that hasn't been shaped yet —
         // report the line's left edge rather than panicking.
-        let p = l
-            .wrapped
-            .as_ref()
-            .and_then(|w| w.position_for_index(disp, l.line_height))
-            .unwrap_or_default();
+        let p = l.caret_pos(disp).unwrap_or_default();
         Some((p.x + l.x_offset(p.y), l.top + p.y, l.line_height))
     }
 }
