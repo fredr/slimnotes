@@ -9,8 +9,8 @@ use std::time::Duration;
 use gpui::{
     actions, div, px, size, AnyElement, App, AppContext, Application, Context, Entity, FocusHandle,
     DragMoveEvent, InteractiveElement, IntoElement, KeyBinding, MouseButton, ParentElement,
-    PathPromptOptions, Pixels, Render, SharedString, StatefulInteractiveElement, Styled,
-    Subscription, Window, WindowBounds, WindowOptions,
+    PathPromptOptions, Pixels, Render, ScrollHandle, SharedString, StatefulInteractiveElement,
+    Styled, Subscription, Window, WindowBounds, WindowOptions,
 };
 use gpui_component::{
     button::{Button, ButtonVariants},
@@ -147,6 +147,18 @@ struct SlimNotes {
     /// A tree row that is currently a text field: naming a new note or folder,
     /// or renaming an existing one.
     edit: Option<sidebar::SidebarEdit>,
+    /// The file tree's scroll offset, owned here rather than left inside the
+    /// element so the sidebar can scroll itself — to a row being named, and
+    /// while an entry is dragged towards an edge.
+    tree_scroll: ScrollHandle,
+    /// Pixels to scroll the tree per tick while dragging an entry, or `None`
+    /// when the pointer is not in either edge zone. Set from the drag's move
+    /// events and consumed by the loop `sidebar::drag_scroll` spawns, which is
+    /// what keeps the tree moving while the pointer is held still.
+    drag_scroll: Option<Pixels>,
+    /// Invalidates a running drag-autoscroll loop, so a new drag never ends up
+    /// with two loops scrolling at once.
+    drag_scroll_gen: u64,
     save_gen: u64,
     _editor_sub: Option<Subscription>,
     _watcher: Option<VaultWatcher>,
@@ -175,6 +187,9 @@ impl SlimNotes {
             status: None,
             resizing_sidebar: false,
             edit: None,
+            tree_scroll: ScrollHandle::new(),
+            drag_scroll: None,
+            drag_scroll_gen: 0,
             save_gen: 0,
             _editor_sub: None,
             _watcher: None,

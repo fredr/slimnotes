@@ -6,11 +6,12 @@
 
 use std::path::{Path, PathBuf};
 use std::rc::Rc;
+use std::time::Duration;
 
 use gpui::{
-    div, px, AnyElement, App, AppContext, ClickEvent, Context, Entity, Focusable,
-    InteractiveElement, IntoElement, ParentElement, SharedString, StatefulInteractiveElement,
-    Styled, Subscription, Window,
+    div, point, px, AnyElement, App, AppContext, ClickEvent, Context, DragMoveEvent, Entity,
+    Focusable, InteractiveElement, IntoElement, ParentElement, Pixels, SharedString,
+    StatefulInteractiveElement, Styled, Subscription, Window,
 };
 use gpui_component::{
     button::{Button, ButtonVariants},
@@ -171,10 +172,18 @@ impl SlimNotes {
                     ),
             )
             .child(
+                // The rows are this element's own children rather than a nested
+                // column: `ScrollHandle::scroll_to_item` addresses the tracked
+                // element's *immediate* children, which is how a row being
+                // named is brought into view.
                 div()
                     .id(SharedString::from("tree-scroll"))
                     .flex_1()
+                    .flex()
+                    .flex_col()
+                    .gap_px()
                     .overflow_y_scroll()
+                    .track_scroll(&self.tree_scroll)
                     .px_2()
                     .pb_4()
                     // Dropping on the tree's empty space moves an entry to the
@@ -188,11 +197,18 @@ impl SlimNotes {
                             this.move_into(&dragged.path, &root, cx);
                         }
                     }))
-                    .child(
-                        v_flex()
-                            .gap_px()
-                            .children(self.render_tree(&self.tree, &root, 0, cx)),
-                    ),
+                    // Dragging towards an edge scrolls the tree, so an entry can
+                    // be dropped somewhere that is off screen. The listener runs
+                    // for every move while an entry is in flight — not only
+                    // while the pointer is over the tree — so `bounds` is the
+                    // tree's viewport and the pointer may be outside it.
+                    .on_drag_move(cx.listener(
+                        |this, e: &DragMoveEvent<DragEntry>, _, cx| {
+                            let y = e.event.position.y - e.bounds.origin.y;
+                            this.drag_scroll(y, e.bounds.size.height, cx);
+                        },
+                    ))
+                    .children(self.render_tree(&self.tree, &root, 0, cx)),
             )
     }
 
@@ -267,6 +283,11 @@ impl SlimNotes {
                 out.push(
                     h_flex()
                         .id(SharedString::from(format!("dir-{key}")))
+                        // A row keeps its natural height: the rows are the
+                        // scrolling column's own children, and a flex child is
+                        // shrinkable by default — which would squeeze a long
+                        // tree to fit instead of letting it scroll.
+                        .flex_shrink_0()
                         .items_center()
                         .gap_1()
                         .overflow_hidden()
@@ -325,6 +346,7 @@ impl SlimNotes {
 
                 let mut row = h_flex()
                     .id(SharedString::from(format!("file-{id}")))
+                    .flex_shrink_0()
                     .items_center()
                     .overflow_hidden()
                     .pl(pad_left)
@@ -380,6 +402,7 @@ impl SlimNotes {
             return div().into_any_element();
         };
         h_flex()
+            .flex_shrink_0()
             .items_center()
             .pl(px(2.0 + depth as f32 * 12.0))
             .pr_2()
@@ -552,6 +575,9 @@ impl SlimNotes {
         if self.vault.as_deref() != Some(parent.as_path()) {
             self.expand_folder(&parent);
         }
+        // A row that is created below the fold is no use: the field is focused,
+        // so whatever is typed goes somewhere the user cannot see.
+        self.reveal_edit_row();
 
         // Focus waits for the next frame: an edit started from the context menu
         // runs inside the menu's click handler, and the menu re-focuses itself
@@ -778,6 +804,148 @@ impl SlimNotes {
         self.expanded.insert(crate::vault_key(dir));
         self.persist_expanded();
     }
+
+    /// Position of the edited row in the tree's flat list of rows, which is what
+    /// [`gpui::ScrollHandle::scroll_to_item`] addresses.
+    ///
+    /// Walks the tree in exactly the order [`Self::render_tree`] emits rows —
+    /// each entry, then its children while it is expanded, and a row being named
+    /// last inside its parent — so the two have to be changed together. A rename
+    /// takes over the row of the entry it renames, so it has that row's index.
+    fn edit_row_index(&self) -> Option<usize> {
+        fn walk(
+            this: &SlimNotes,
+            entries: &[Entry],
+            dir: &Path,
+            kind: &EditKind,
+            next: &mut usize,
+        ) -> Option<usize> {
+            for entry in entries {
+                if this.is_renaming(&entry.path) {
+                    return Some(*next);
+                }
+                *next += 1;
+                if entry.is_dir && this.expanded.contains(&crate::vault_key(&entry.path)) {
+                    if let Some(found) = walk(this, &entry.children, &entry.path, kind, next) {
+                        return Some(found);
+                    }
+                }
+            }
+            let new_row = matches!(
+                kind,
+                EditKind::NewNote { parent } | EditKind::NewFolder { parent } if parent == dir
+            );
+            new_row.then_some(*next)
+        }
+
+        let kind = &self.edit.as_ref()?.kind;
+        let root = self.vault.as_deref()?;
+        walk(self, &self.tree, root, kind, &mut 0)
+    }
+
+    /// Scroll the tree just enough to show the row being named, for a row that
+    /// is created off screen — a new folder at the bottom of a long tree, say.
+    ///
+    /// The scroll is requested rather than performed: the row does not exist in
+    /// the layout yet, and `scroll_to_item` waits for the frame where the index
+    /// it names has been laid out.
+    fn reveal_edit_row(&mut self) {
+        if let Some(ix) = self.edit_row_index() {
+            self.tree_scroll.scroll_to_item(ix);
+        }
+    }
+
+    /// Aim drag-autoscroll at a pointer `y` relative to the top of the tree's
+    /// viewport, which is `height` tall. Starting it spawns a loop that keeps
+    /// scrolling until the pointer leaves the edge zone or the drag ends;
+    /// calling it again while that loop runs only changes the speed.
+    fn drag_scroll(&mut self, y: Pixels, height: Pixels, cx: &mut Context<Self>) {
+        let step = drag_scroll_step(y, height);
+        let start = self.drag_scroll.is_none();
+        self.drag_scroll = (step != px(0.)).then_some(step);
+        if !start || self.drag_scroll.is_none() {
+            return;
+        }
+        self.drag_scroll_gen = self.drag_scroll_gen.wrapping_add(1);
+        let generation = self.drag_scroll_gen;
+        cx.spawn(async move |this, cx| {
+            loop {
+                cx.background_executor().timer(DRAG_SCROLL_TICK).await;
+                let go = this
+                    .update(cx, |this, cx| {
+                        this.drag_scroll_gen == generation && this.drag_scroll_tick(cx)
+                    })
+                    .unwrap_or(false); // the view was dropped
+                if !go {
+                    break;
+                }
+            }
+        })
+        .detach();
+    }
+
+    /// One drag-autoscroll tick. Returns whether to keep going.
+    fn drag_scroll_tick(&mut self, cx: &mut Context<Self>) -> bool {
+        let Some(step) = self.drag_scroll else { return false };
+        // The drop (or a cancelled drag) is the end of it. Mouse-up does not
+        // reach the tree when it happens somewhere else in the window, so this
+        // is what stops the loop then.
+        if !cx.has_active_drag() {
+            self.drag_scroll = None;
+            return false;
+        }
+        let offset = self.tree_scroll.offset();
+        // A scroll offset is 0 at the top and negative from there, so scrolling
+        // down (a positive step) subtracts.
+        let y = (offset.y - step).clamp(-self.tree_scroll.max_offset().height, px(0.));
+        if y != offset.y {
+            self.tree_scroll.set_offset(point(offset.x, y));
+            cx.notify();
+        }
+        // Keep ticking even at either end: the pointer is still in the edge
+        // zone, and the drag may come back the other way.
+        true
+    }
+}
+
+/// How often drag-autoscroll ticks (~60Hz), which is what makes the steps below
+/// a speed rather than a distance.
+const DRAG_SCROLL_TICK: Duration = Duration::from_millis(16);
+/// Depth of the hot zone at each end of the tree's viewport.
+const DRAG_SCROLL_EDGE: f32 = 28.0;
+/// Step at the inner edge of the zone (~90 px/s): slow enough to aim at a folder
+/// that is only just coming into view.
+const DRAG_SCROLL_MIN: f32 = 1.5;
+/// Step at the viewport edge and beyond (~1080 px/s), to cross a long tree.
+const DRAG_SCROLL_MAX: f32 = 18.0;
+
+/// How far to scroll the tree in one tick while dragging an entry, given the
+/// pointer's y relative to the top of the tree's viewport: negative to scroll
+/// up, positive to scroll down, zero anywhere in the middle.
+///
+/// A function of position only, never of movement — that is what lets the tree
+/// keep scrolling while the pointer is held at the edge, which is the whole
+/// point. Unlike the editor's drag-selection equivalent, the zone reaches
+/// *inside* the viewport: a drop target has to be visible to be aimed at, so the
+/// pointer is over the last visible row exactly when the list needs to move. It
+/// keeps ramping past the edge, where the pointer has left the tree altogether.
+fn drag_scroll_step(y: Pixels, height: Pixels) -> Pixels {
+    let (y, h) = (f32::from(y), f32::from(height));
+    // In a viewport too short for two full zones they meet in the middle rather
+    // than overlapping, which would make the speed jump at the seam.
+    let edge = DRAG_SCROLL_EDGE.min(h / 2.);
+    if edge <= 0. {
+        return px(0.);
+    }
+    let over = if y < edge {
+        y - edge
+    } else if y > h - edge {
+        y - (h - edge)
+    } else {
+        return px(0.);
+    };
+    let t = (over.abs() / edge).min(1.);
+    px(over.signum() * (DRAG_SCROLL_MIN + (DRAG_SCROLL_MAX - DRAG_SCROLL_MIN) * t))
 }
 
 /// An entry being dragged through the tree. Renders as the label that follows
@@ -817,4 +985,50 @@ fn validate_name(name: &str) -> Result<(), &'static str> {
         return Err("Names starting with a dot are hidden");
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn step(y: f32, height: f32) -> f32 {
+        f32::from(drag_scroll_step(px(y), px(height)))
+    }
+
+    #[test]
+    fn drag_scroll_is_still_in_the_middle_of_the_tree() {
+        // Anywhere clear of both zones, dragging must not move the list.
+        for y in [DRAG_SCROLL_EDGE, 100., 200., 300. - DRAG_SCROLL_EDGE] {
+            assert_eq!(step(y, 300.), 0., "y = {y}");
+        }
+    }
+
+    #[test]
+    fn drag_scroll_ramps_towards_the_edge_it_is_nearest() {
+        // Up (negative) at the top, down (positive) at the bottom, and the two
+        // ends mirror each other.
+        assert_eq!(step(DRAG_SCROLL_EDGE / 2., 300.), -step(300. - DRAG_SCROLL_EDGE / 2., 300.));
+        assert!(step(20., 300.) < 0.);
+        assert!(step(290., 300.) > 0.);
+        // Speed grows as the pointer nears the edge...
+        assert!(step(5., 300.) < step(20., 300.));
+        // ...to a cap that a pointer dragged clean out of the tree cannot exceed.
+        assert_eq!(step(0., 300.), -DRAG_SCROLL_MAX);
+        assert_eq!(step(-500., 300.), -DRAG_SCROLL_MAX);
+        assert_eq!(step(300., 300.), DRAG_SCROLL_MAX);
+        assert_eq!(step(9000., 300.), DRAG_SCROLL_MAX);
+    }
+
+    #[test]
+    fn drag_scroll_zones_meet_rather_than_overlap_in_a_short_tree() {
+        // A viewport shorter than two zones: every point still resolves to one
+        // direction, and the middle is the only place with no scroll.
+        let h = DRAG_SCROLL_EDGE; // half a zone at each end
+        assert!(step(1., h) < 0.);
+        assert!(step(h - 1., h) > 0.);
+        assert_eq!(step(h / 2., h), 0.);
+        // A collapsed viewport has no edges to speak of.
+        assert_eq!(step(0., 0.), 0.);
+        assert_eq!(step(10., -5.), 0.);
+    }
 }
