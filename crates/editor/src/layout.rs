@@ -66,6 +66,38 @@ impl VisualLine {
         })
     }
 
+    /// Where this line's list marker is drawn, in line-local x — the anchor the
+    /// drag grip hangs off. `None` unless the line is a movable list item that
+    /// has actually been shaped (an off-screen line has no glyph positions, and
+    /// nothing to hover anyway).
+    ///
+    /// Rendered lines only: a line inside a fenced block that happens to start
+    /// with `- ` is code, a table row is a grid, and `- - -` is a rule.
+    pub(crate) fn marker_x(&self) -> Option<Pixels> {
+        if self.code_bg || self.hr || self.table.is_some() {
+            return None;
+        }
+        let indent = item_indent(&self.source)?;
+        let wrapped = self.wrapped.as_ref()?;
+        let disp = src_to_disp(&self.segs, indent);
+        let pos = wrapped.position_for_index(disp, self.line_height)?;
+        Some(pos.x + self.left_inset)
+    }
+
+    /// Line-local rect of the drag grip's dots.
+    ///
+    /// x is negative for an unindented item: the grip lives out in the left
+    /// padding, which is what makes it read as a gutter handle rather than as
+    /// part of the text. A nested item's grip follows its indent, so there is
+    /// never a question about which item is about to be picked up.
+    pub(crate) fn grip_rect(&self) -> Option<Bounds<Pixels>> {
+        let x = self.marker_x()? - px(GRIP_GAP + GRIP_W);
+        Some(Bounds {
+            origin: point(x, (self.line_height - px(GRIP_H)) / 2.),
+            size: size(px(GRIP_W), px(GRIP_H)),
+        })
+    }
+
     /// Where the caret belongs for display byte `disp`, in line-local
     /// coordinates — [`Self::check_rect`]'s `position_for_index`, but resolving
     /// soft-wrap boundaries the other way.
@@ -577,6 +609,15 @@ pub(crate) fn word_left(text: &str, offset: usize) -> usize {
         None => {}
     }
     i
+}
+
+/// The vertical span of a list item — the top of its first line to the bottom
+/// of its last — in content coordinates. `None` if its lines are not in this
+/// layout, which is what a document changing mid-drag looks like.
+pub(crate) fn item_span(layout: &Layout, item: &Range<usize>) -> Option<(Pixels, Pixels)> {
+    let first = layout.lines.get(item.start)?;
+    let last = layout.lines.get(item.end.checked_sub(1)?)?;
+    Some((first.top, last.top + last.height))
 }
 
 pub(crate) fn offset_to_line_col(text: &str, offset: usize) -> (usize, usize) {

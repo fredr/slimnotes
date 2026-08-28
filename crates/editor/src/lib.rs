@@ -32,6 +32,7 @@ mod images;
 mod input;
 mod layout;
 mod parse;
+mod reorder;
 mod scrollbar;
 mod segments;
 mod tables;
@@ -43,6 +44,7 @@ pub(crate) use images::*;
 pub(crate) use input::*;
 pub(crate) use layout::*;
 pub(crate) use parse::*;
+pub(crate) use reorder::*;
 pub(crate) use scrollbar::*;
 pub(crate) use segments::*;
 pub(crate) use tables::*;
@@ -66,12 +68,23 @@ pub(crate) const ACCENT: u32 = 0x9d86e9;
 pub(crate) const HIGHLIGHT_BG: u32 = 0xd6c04a; // ==highlight== background (highlighter yellow)
 pub(crate) const HIGHLIGHT_FG: u32 = 0x1e1e1e; // dark text on the highlight
 pub(crate) const TAG_BG: u32 = 0x9d86e933; // #tag pill background (translucent accent)
+pub(crate) const GRIP_BAND: u32 = 0x9d86e91a; // the rows of a list item being dragged
 pub(crate) const SCROLLBAR: u32 = 0x6e6e6e66; // overlay thumb, idle (translucent grey)
 pub(crate) const SCROLLBAR_HOVER: u32 = 0x9a9a9acc; // thumb while hovered or dragged
 
 pub(crate) const IMAGE_MAX_H: f32 = 400.0; // cap rendered image height (px)
 pub(crate) const IMAGE_PAD: f32 = 6.0; // vertical breathing room around an image (px)
 pub(crate) const QUOTE_INDENT: f32 = 22.0; // left indent per blockquote nesting level (px)
+
+// The drag grip: six dots in the gutter beside a list item, there to be grabbed
+// and dragged up or down its list. Sized to read as a handle without competing
+// with the bullet it sits next to.
+pub(crate) const GRIP_DOT: f32 = 2.5; // diameter of one dot
+pub(crate) const GRIP_PITCH: f32 = 4.0; // centre-to-centre spacing
+pub(crate) const GRIP_W: f32 = GRIP_PITCH + GRIP_DOT; // 2 columns
+pub(crate) const GRIP_H: f32 = 2.0 * GRIP_PITCH + GRIP_DOT; // 3 rows
+pub(crate) const GRIP_GAP: f32 = 8.0; // clearance between the grip and the marker
+pub(crate) const GRIP_HIT_PAD: f32 = 5.0; // widens the press target around the dots
 
 /// Inset from the window edge to the text, on all four sides.
 ///
@@ -197,6 +210,13 @@ pub struct MarkdownEditor {
     pub(crate) layout_reveal: Option<Reveal>,
     pub(crate) shapes: ShapeCaches, // persistent shaped lines + table cells
     pub(crate) table_menu: Option<TableMenu>, // open table cell context menu, if any
+    /// The list item showing a drag grip: the source line index of its marker.
+    /// Set by hovering the gutter beside it, and cleared by any edit — pointer
+    /// motion is the only thing that decides it, so it can never outlive the
+    /// line it named.
+    pub(crate) grip_hover: Option<usize>,
+    /// The list-item drag in flight, if any.
+    pub(crate) grip_drag: Option<GripDrag>,
 }
 
 impl MarkdownEditor {
@@ -240,6 +260,8 @@ impl MarkdownEditor {
             layout_reveal: None,
             shapes: ShapeCaches::default(),
             table_menu: None,
+            grip_hover: None,
+            grip_drag: None,
         };
         this.maybe_drag_test(cx);
         this
@@ -248,6 +270,9 @@ impl MarkdownEditor {
     /// Refresh the `text` cache from the buffer after a mutation.
     fn sync_text(&mut self) {
         self.text = self.buffer.text();
+        // Line numbers have just moved under it, and the pointer hasn't; the
+        // next mouse move recomputes it against the new text.
+        self.grip_hover = None;
     }
 
     /// Apply a table structural edit (from the context menu) and place the caret
@@ -355,6 +380,8 @@ impl MarkdownEditor {
         self.layout = None;
         self.layout_sig = None;
         self.layout_reveal = None;
+        self.grip_hover = None;
+        self.grip_drag = None;
         self.shapes = ShapeCaches::default();
         self.base_dir = base_dir;
         self.vault_dir = vault_dir;
@@ -460,6 +487,50 @@ impl MarkdownEditor {
         let in_code = self.ensure_parsed().code[line].in_block;
         let (range, insert) = newline_edit(&self.text, self.cursor, in_code);
         self.edit(range, &insert, None);
+    }
+
+    /// Tab. On a list item this demotes it — the item, and everything nested
+    /// under it, become children of the item above — which is what a list wants
+    /// from tab. Anywhere else it inserts a soft tab, as it always did.
+    ///
+    /// Returns whether the text changed. On the first item of a list there is
+    /// no sibling to become a child of, and leaving the text alone beats
+    /// inserting a stray indent that only looks like nesting.
+    fn insert_tab(&mut self) -> bool {
+        if self.selection().is_none() {
+            let line = offset_to_line_col(&self.text, self.cursor).0;
+            // Inside a fenced block a leading `- ` is code, not a list.
+            let in_code = self.ensure_parsed().code[line].in_block;
+            if !in_code && item_indent(line_str(&self.text, line)).is_some() {
+                let Some((range, new, shift)) = indent_edit(&self.text, line) else {
+                    return false;
+                };
+                let caret = self.cursor + shift;
+                self.edit(range, &new, None);
+                self.cursor = caret.min(self.text.len());
+                return true;
+            }
+        }
+        self.insert(INDENT);
+        true
+    }
+
+    /// Shift-tab: the inverse, promoting the item and its children one level.
+    fn outdent_item(&mut self) -> bool {
+        if self.selection().is_some() {
+            return false;
+        }
+        let line = offset_to_line_col(&self.text, self.cursor).0;
+        if self.ensure_parsed().code[line].in_block {
+            return false;
+        }
+        let Some((range, new, shift)) = outdent_edit(&self.text, line) else {
+            return false;
+        };
+        let caret = self.cursor.saturating_sub(shift);
+        self.edit(range, &new, None);
+        self.cursor = caret.min(self.text.len());
+        true
     }
 
     fn backspace(&mut self) {
@@ -677,13 +748,25 @@ impl MarkdownEditor {
     /// under it has. Returns whether to keep ticking.
     fn autoscroll_tick(&mut self, cx: &mut Context<Self>) -> bool {
         let Some(pos) = self.autoscroll else { return false };
-        if !self.dragging {
+        let carrying = self.grip_drag.is_some();
+        if !self.dragging && !carrying {
             self.autoscroll = None; // button released without a mouse-up here
             return false;
         }
         let step = drag_scroll_step(pos.y, self.viewport_height);
         let max = max_scroll(self.total_height(), self.viewport_height);
         let scrolled = (self.scroll_top + step).clamp(px(0.), max);
+        // Carrying a list item: scroll the page under it and re-aim at whatever
+        // gap the pointer now sits over — the pointer is still, the list moved.
+        if carrying {
+            if scrolled != self.scroll_top {
+                self.scroll_top = scrolled;
+                self.scroll_to_caret = false;
+                self.update_grip_target(pos.y + scrolled, cx);
+                cx.notify();
+            }
+            return true;
+        }
         let cursor = match self.layout.clone() {
             Some(layout) => layout.offset_at(pos.x, pos.y + scrolled),
             None => self.cursor,
@@ -789,6 +872,159 @@ impl MarkdownEditor {
             }
         }
         None
+    }
+
+    // ---- dragging a list item by its gutter grip ----
+
+    /// The list item whose gutter the pointer is in: the band running from the
+    /// window's left edge to the item's marker, on the item's first row.
+    ///
+    /// Deliberately generous. The grip itself is a small target, and this band
+    /// is what puts it under the pointer before you have gone looking for it.
+    pub(crate) fn gutter_item_at(
+        &self,
+        pos: Point<Pixels>,
+        content: Bounds<Pixels>,
+    ) -> Option<usize> {
+        let layout = self.layout.as_ref()?;
+        let x = pos.x - content.origin.x;
+        let content_y = pos.y - content.origin.y + self.scroll_top;
+        let li = layout.line_index_at_y(content_y)?;
+        let l = layout.lines.get(li)?;
+        let marker_x = l.marker_x()?;
+        let local_y = content_y - l.top;
+        // The first row only: the grip is drawn there, and a wrapped row's own
+        // gutter would otherwise offer a handle 30px above the pointer.
+        (local_y >= px(0.) && local_y < l.line_height && x < marker_x && x >= px(-CONTENT_PAD))
+            .then_some(li)
+    }
+
+    /// Whether the pointer is on the grip itself, which is what a press acts
+    /// on. Kept to the dots plus a little, so clicking anywhere else in the
+    /// margin still places the caret — and only where a grip is actually drawn,
+    /// so what can be grabbed is exactly what can be seen.
+    pub(crate) fn grip_hit(&self, pos: Point<Pixels>, content: Bounds<Pixels>) -> Option<usize> {
+        let li = self.grip_hover?;
+        let l = self.layout.as_ref()?.lines.get(li)?;
+        let r = l.grip_rect()?;
+        let hit = Bounds {
+            origin: point(r.origin.x - px(GRIP_HIT_PAD), l.top),
+            size: size(r.size.width + px(2. * GRIP_HIT_PAD), l.line_height),
+        };
+        let at = point(
+            pos.x - content.origin.x,
+            pos.y - content.origin.y + self.scroll_top,
+        );
+        hit.contains(&at).then_some(li)
+    }
+
+    /// Pick up the item whose marker is on `line`.
+    pub(crate) fn start_grip_drag(&mut self, line: usize, cx: &mut Context<Self>) {
+        let Some((run, from)) = sibling_run(&self.text, line) else { return };
+        if run.items.len() < 2 {
+            return; // an only child has nowhere to go
+        }
+        self.grip_drag = Some(GripDrag { run, from, to: from });
+        self.dragging = false; // never also a text selection
+        self.scroll_to_caret = false;
+        cx.notify();
+    }
+
+    /// Re-aim the drag at the gap the pointer is now over.
+    pub(crate) fn update_grip_target(&mut self, content_y: Pixels, cx: &mut Context<Self>) {
+        let to = match self.grip_drag.as_ref() {
+            Some(d) => self.grip_target(&d.run, d.from, content_y),
+            None => return,
+        };
+        if let Some(d) = self.grip_drag.as_mut() {
+            if d.to != to {
+                d.to = to;
+                cx.notify();
+            }
+        }
+    }
+
+    /// Drop the item: apply the move if it goes anywhere, and let go.
+    pub(crate) fn finish_grip_drag(&mut self, cx: &mut Context<Self>) {
+        let Some(d) = self.grip_drag.take() else { return };
+        self.set_autoscroll(None, cx);
+        if self.move_list_item(&d) {
+            cx.emit(EditorEvent::Changed);
+        }
+        cx.notify();
+    }
+
+    /// The gap the pointer is over, as an index into the run *without* the
+    /// dragged item: the number of the other items whose middle it has passed.
+    fn grip_target(&self, run: &Run, from: usize, content_y: Pixels) -> usize {
+        let Some(layout) = self.layout.as_ref() else { return from };
+        let mut to = 0;
+        let mut slot = 0;
+        for (k, item) in run.items.iter().enumerate() {
+            if k == from {
+                continue;
+            }
+            if let Some((top, bottom)) = item_span(layout, item) {
+                if content_y > (top + bottom) / 2. {
+                    to = slot + 1;
+                }
+            }
+            slot += 1;
+        }
+        to
+    }
+
+    /// Where to draw the line showing where the item would land: the top of the
+    /// item that would follow it, or the bottom of the run when it goes last.
+    pub(crate) fn grip_drop_y(&self, d: &GripDrag) -> Option<Pixels> {
+        let layout = self.layout.as_ref()?;
+        let others: Vec<&Range<usize>> = d
+            .run
+            .items
+            .iter()
+            .enumerate()
+            .filter(|(k, _)| *k != d.from)
+            .map(|(_, r)| r)
+            .collect();
+        match others.get(d.to) {
+            Some(item) => item_span(layout, item).map(|(top, _)| top),
+            None => item_span(layout, others.last()?).map(|(_, bottom)| bottom),
+        }
+    }
+
+    /// Apply the move as one undoable edit. Returns whether anything changed.
+    fn move_list_item(&mut self, d: &GripDrag) -> bool {
+        // The run was captured on press. Make sure the text still says the same
+        // thing before rewriting a region of it — a reload, or a keystroke from
+        // the other hand, can land mid-drag.
+        let Some(marker) = d.run.items.get(d.from).map(|r| r.start) else {
+            return false;
+        };
+        if sibling_run(&self.text, marker).as_ref() != Some(&(d.run.clone(), d.from)) {
+            return false;
+        }
+        let Some((range, new, order)) = reorder_edit(&self.text, &d.run, d.from, d.to) else {
+            return false;
+        };
+        let region_start = d.run.region().start;
+        let (caret_line, caret_col) = offset_to_line_col(&self.text, self.cursor);
+        let caret_to = order.iter().position(|&l| l == caret_line);
+        let caret = self.cursor;
+        self.buffer.replace(range, &new, self.cursor, None);
+        self.sync_text();
+        // The region is a permutation of its own lines, so it is exactly as long
+        // as it was: a caret outside it still points at the same character, and
+        // one inside it has only changed line.
+        self.cursor = match caret_to {
+            Some(p) => {
+                (line_start(&self.text, region_start + p) + caret_col).min(self.text.len())
+            }
+            None => caret.min(self.text.len()),
+        };
+        self.anchor = None;
+        self.goal_x = None;
+        self.scroll_to_caret = false;
+        true
     }
 
     pub(crate) fn toggle_checkbox(&mut self, inner_abs: usize) {
@@ -1505,6 +1741,49 @@ mod tests {
         assert_eq!(enter("-   |"), "|");
         // A third press is then an ordinary newline.
         assert_eq!(enter("- one\n|"), "- one\n\n|");
+    }
+
+    #[test]
+    fn an_empty_nested_item_climbs_out_a_level() {
+        // Rather than ending the list outright, it becomes the next item of the
+        // list its parent belongs to.
+        assert_eq!(enter("- a\n  - |"), "- a\n- |");
+        // Only the empty one moves; the items above are left alone.
+        assert_eq!(enter("- a\n  - b\n  - |"), "- a\n  - b\n- |");
+    }
+
+    #[test]
+    fn climbing_out_takes_one_press_per_level() {
+        let three = "- a\n  - b\n    - c\n      - |";
+        let two = enter(three);
+        assert_eq!(two, "- a\n  - b\n    - c\n    - |");
+        let one = enter(&two);
+        assert_eq!(one, "- a\n  - b\n    - c\n  - |");
+        let zero = enter(&one);
+        assert_eq!(zero, "- a\n  - b\n    - c\n- |");
+        // And at the margin the list ends, as it always did.
+        assert_eq!(enter(&zero), "- a\n  - b\n    - c\n|");
+    }
+
+    #[test]
+    fn climbing_out_takes_the_parents_kind_of_marker() {
+        // A task parent hands back an unchecked box...
+        assert_eq!(enter("- [ ] a\n  - [ ] |"), "- [ ] a\n- [ ] |");
+        // ...and an ordered parent hands back its own next number, so popping
+        // out of a sub-list doesn't restart the count.
+        assert_eq!(enter("3. three\n   1. sub\n   2. |"), "3. three\n   1. sub\n4. |");
+        // A parent bulleted with `*` keeps that marker rather than imposing `-`.
+        assert_eq!(enter("* a\n  * |"), "* a\n* |");
+    }
+
+    #[test]
+    fn an_indented_item_with_no_parent_still_ends_the_list() {
+        // Nothing above to climb out to: the indent is just an indent.
+        assert_eq!(enter("  - |"), "|");
+        // A paragraph in between is not a parent either.
+        assert_eq!(enter("- a\n\nsome prose\n  - |"), "- a\n\nsome prose\n|");
+        // But a blank line alone doesn't break the nesting.
+        assert_eq!(enter("- a\n\n  - |"), "- a\n\n- |");
     }
 
     #[test]

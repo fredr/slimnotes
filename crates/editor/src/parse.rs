@@ -402,12 +402,50 @@ pub(crate) fn newline_edit(text: &str, cursor: usize, in_code: bool) -> (Range<u
         return plain();
     };
     if line[prefix_len..].trim().is_empty() {
+        let start = line_start(text, line_idx);
+        let indent = line.len() - line.trim_start().len();
+        // An empty *nested* item climbs out a level instead of ending the list:
+        // it becomes the next item of the list its parent sits in, which is
+        // what a second enter means inside a sub-list. Press again and it
+        // climbs another level, and at the margin it ends the list as below.
+        //
+        // The new marker is whatever the parent's own list would put after it,
+        // so an ordered parent's number advances and a task parent's box comes
+        // back unchecked — the same rule that continuing a list already uses.
+        if indent > 0 {
+            if let Some(parent) = parent_item(text, line_idx, indent) {
+                if let Some((_, next)) = list_prefix(line_str(text, parent)) {
+                    return (start..start + line.len(), next);
+                }
+            }
+        }
         // Clear the whole line rather than just the marker: what would be left
         // of an empty item is invisible trailing whitespace.
-        let start = line_start(text, line_idx);
         return (start..start + line.len(), String::new());
     }
     (cursor..cursor, format!("\n{next}"))
+}
+
+/// The item that the one on `line` is nested under: the nearest list item above
+/// it indented less than `indent`.
+///
+/// Blank lines are stepped over — a loose list is still a list — but anything
+/// else that isn't a list item ends the search, since a paragraph in between
+/// means the item above is not a parent to climb back out to.
+fn parent_item(text: &str, line: usize, indent: usize) -> Option<usize> {
+    let mut i = line;
+    while i > 0 {
+        i -= 1;
+        let l = line_str(text, i);
+        if l.trim().is_empty() {
+            continue;
+        }
+        list_prefix(l)?;
+        if l.len() - l.trim_start().len() < indent {
+            return Some(i);
+        }
+    }
+    None
 }
 
 /// A list item's marker: the byte length of the prefix that precedes its

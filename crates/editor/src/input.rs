@@ -50,6 +50,7 @@ actions!(
         Delete,
         InsertNewline,
         InsertTab,
+        Outdent,
         // Clipboard, history, selection.
         Copy,
         Cut,
@@ -92,6 +93,7 @@ pub(crate) fn bind_default_keys(cx: &mut App) {
             KeyBinding::new("delete", Delete, c),
             KeyBinding::new("enter", InsertNewline, c),
             KeyBinding::new("tab", InsertTab, c),
+            KeyBinding::new("shift-tab", Outdent, c),
             KeyBinding::new("escape", Cancel, c),
         ];
         // Word-wise arrows use alt on macOS, ctrl elsewhere; the clipboard /
@@ -200,7 +202,14 @@ impl MarkdownEditor {
             Backspace           => true,  |this, _c| this.backspace();
             Delete              => true,  |this, _c| this.delete_forward();
             InsertNewline       => true,  |this, _c| this.insert_newline();
-            InsertTab           => true,  |this, _c| this.insert("  ");
+            // These two decide for themselves whether anything changed: on the
+            // first item of a list, or outside one, there may be nothing to do.
+            InsertTab           => false, |this, c| if this.insert_tab() {
+                c.emit(crate::EditorEvent::Changed)
+            };
+            Outdent             => false, |this, c| if this.outdent_item() {
+                c.emit(crate::EditorEvent::Changed)
+            };
             Copy                => false, |this, c| this.copy(c);
             Cut                 => true,  |this, c| this.cut(c);
             Paste               => true,  |this, c| this.paste(c);

@@ -323,6 +323,10 @@ pub(crate) struct Prepaint {
     hitbox: Hitbox,
     /// Links and checkboxes: clicking acts on them, so they get a hand pointer.
     hands: Vec<Hitbox>,
+    /// The drag grip showing in the gutter, if any: a grab pointer.
+    grip: Option<Hitbox>,
+    /// A list item is in flight, so the whole window shows a grabbing pointer.
+    grip_held: bool,
 }
 
 impl IntoElement for EditorElement {
@@ -349,7 +353,7 @@ impl EditorElement {
         let content = content_rect(bounds);
         let viewport_height = content.size.height;
         let scroll_track = bounds.size.height;
-        let marked = self.editor.update(cx, |e, _| {
+        let (marked, grip_line, grip_held) = self.editor.update(cx, |e, _| {
             e.scroll_top = scroll_top;
             e.scroll_to_caret = false;
             // Every prepaint path ends here, so this is the one place the frame's
@@ -358,7 +362,8 @@ impl EditorElement {
             // nothing).
             e.viewport_height = viewport_height;
             e.scroll_track = scroll_track;
-            e.marked_range.as_ref().map(|r| (r.start, r.end))
+            let marked = e.marked_range.as_ref().map(|r| (r.start, r.end));
+            (marked, e.grip_hover, e.grip_drag.is_some())
         });
         // Pointer regions. Hitboxes may only be created during prepaint, and
         // `scroll_top` is final by the time we get here, so this is the only
@@ -394,6 +399,21 @@ impl EditorElement {
                     .then(|| window.insert_hitbox(clipped, HitboxBehavior::Normal))
             })
             .collect();
+        // The grip's own hitbox, for the grab pointer. Outside the text area by
+        // design (it lives in the left padding), so it is inserted separately
+        // rather than through `clickable_rects`, which clips to the text.
+        let grip = grip_line.and_then(|li| {
+            let l = layout.lines.get(li)?;
+            let r = l.grip_rect()?;
+            let screen = Bounds {
+                origin: point(
+                    content.origin.x + r.origin.x - px(GRIP_HIT_PAD),
+                    content.origin.y - scroll_top + l.top,
+                ),
+                size: size(r.size.width + px(2. * GRIP_HIT_PAD), l.line_height),
+            };
+            Some(window.insert_hitbox(screen, HitboxBehavior::Normal))
+        });
         Prepaint {
             layout,
             scroll_top,
@@ -402,6 +422,8 @@ impl EditorElement {
             marked,
             hitbox,
             hands,
+            grip,
+            grip_held,
         }
     }
 
@@ -1141,6 +1163,14 @@ impl Element for EditorElement {
         for hand in &prepaint.hands {
             window.set_cursor_style(CursorStyle::PointingHand, hand);
         }
+        // The list-item grip: grab where it is showing. While an item is in
+        // flight the grabbing pointer covers everything, so it doesn't flick
+        // back to an I-beam the moment the pointer leaves the handle it holds.
+        if prepaint.grip_held {
+            window.set_cursor_style(CursorStyle::ClosedHand, &prepaint.hitbox);
+        } else if let Some(grip) = &prepaint.grip {
+            window.set_cursor_style(CursorStyle::OpenHand, grip);
+        }
 
         let st = prepaint.scroll_top;
         // Cull against the *window*, not the inset text box. Nothing clips a line
@@ -1467,6 +1497,64 @@ impl Element for EditorElement {
             window.paint_quad(fill(caret, rgb(CARET)));
         }
 
+        // The list-item drag grip: the handle in the gutter, plus — while an
+        // item is in flight — a band over the item and a line where it will
+        // land. After the text loop, so all three sit above the text.
+        {
+            let e = self.editor.read(cx);
+            if let Some(d) = &e.grip_drag {
+                if let Some((top, bottom)) = d
+                    .run
+                    .items
+                    .get(d.from)
+                    .and_then(|item| item_span(&prepaint.layout, item))
+                {
+                    // Wider than the text, like the code panel, so the whole
+                    // item reads as one thing that has been picked up.
+                    let rect = Bounds {
+                        origin: point(content.origin.x - px(8.), content.origin.y - st + top),
+                        size: size(content.size.width + px(16.), bottom - top),
+                    };
+                    window.paint_quad(fill(rect, rgba(GRIP_BAND)));
+                }
+                if let Some(y) = e.grip_drop_y(d) {
+                    let rect = Bounds {
+                        origin: point(content.origin.x, content.origin.y - st + y - px(1.)),
+                        size: size(content.size.width, px(2.)),
+                    };
+                    window.paint_quad(fill(rect, rgb(ACCENT)));
+                }
+            }
+            // Six dots, two by three. Drawn as quads rather than a glyph so the
+            // handle doesn't depend on a font having one.
+            if let Some(l) = e.grip_hover.and_then(|li| prepaint.layout.lines.get(li)) {
+                if let Some(r) = l.grip_rect() {
+                    let color = if e.grip_drag.is_some() { ACCENT } else { MUTED };
+                    let x0 = content.origin.x + r.origin.x;
+                    let y0 = content.origin.y - st + l.top + r.origin.y;
+                    for row in 0..3 {
+                        for col in 0..2 {
+                            let dot = Bounds {
+                                origin: point(
+                                    x0 + px(GRIP_PITCH * col as f32),
+                                    y0 + px(GRIP_PITCH * row as f32),
+                                ),
+                                size: size(px(GRIP_DOT), px(GRIP_DOT)),
+                            };
+                            window.paint_quad(quad(
+                                dot,
+                                Corners::all(px(GRIP_DOT / 2.)),
+                                rgb(color),
+                                px(0.),
+                                transparent_black(),
+                                BorderStyle::Solid,
+                            ));
+                        }
+                    }
+                }
+            }
+        }
+
         // Overlay scrollbar, painted last so it sits above the text. It hugs the
         // window's right edge and its track spans the full window height, so it
         // is drawn against `bounds` while its proportion comes from the inset
@@ -1524,6 +1612,11 @@ impl Element for EditorElement {
                     // selection. Checked here rather than relying on handler
                     // ordering, which GPUI doesn't guarantee.
                     if e.scrollbar().is_some() && in_scrollbar_strip(&bounds, ev.position) {
+                        return;
+                    }
+                    // Likewise a press on a list item's drag grip: it picks the
+                    // item up (below) and must not also move the caret.
+                    if e.grip_hit(ev.position, content).is_some() {
                         return;
                     }
                     let Some(layout) = e.layout.clone() else { return };
@@ -1658,6 +1751,86 @@ impl Element for EditorElement {
                         cx.notify(); // the thumb goes back to its idle shade
                     }
                 });
+            }
+        });
+        // The list-item drag grip. Hovering the gutter beside a bullet or task
+        // item offers a handle; dragging it moves the item, with everything
+        // nested under it, up or down its list. The text handlers above stay
+        // out of the way by testing `grip_hit` themselves rather than relying
+        // on handler ordering, which GPUI doesn't guarantee.
+        window.on_mouse_event({
+            let editor = self.editor.clone();
+            move |ev: &MouseMoveEvent, phase, _window, cx| {
+                if phase != DispatchPhase::Bubble {
+                    return;
+                }
+                editor.update(cx, |e, cx| {
+                    if e.grip_drag.is_some() {
+                        return; // in flight: the drag handler owns the pointer
+                    }
+                    // Not while a button is down (that is a text selection), and
+                    // not under an open menu.
+                    let over = (ev.pressed_button.is_none()
+                        && e.table_menu.is_none()
+                        && bounds.contains(&ev.position))
+                    .then(|| e.gutter_item_at(ev.position, content))
+                    .flatten();
+                    if over != e.grip_hover {
+                        e.grip_hover = over;
+                        cx.notify();
+                    }
+                });
+            }
+        });
+        window.on_mouse_event({
+            let editor = self.editor.clone();
+            move |ev: &MouseDownEvent, phase, window, cx| {
+                if phase != DispatchPhase::Bubble || ev.button != MouseButton::Left {
+                    return;
+                }
+                editor.update(cx, |e, cx| {
+                    let Some(li) = e.grip_hit(ev.position, content) else { return };
+                    e.focus_handle.focus(window);
+                    e.start_grip_drag(li, cx);
+                });
+            }
+        });
+        window.on_mouse_event({
+            let editor = self.editor.clone();
+            move |ev: &MouseMoveEvent, phase, _window, cx| {
+                if phase != DispatchPhase::Bubble {
+                    return;
+                }
+                editor.update(cx, |e, cx| {
+                    if e.grip_drag.is_none() {
+                        return;
+                    }
+                    if ev.pressed_button != Some(MouseButton::Left) {
+                        e.finish_grip_drag(cx); // released outside the window
+                        return;
+                    }
+                    let local = point(
+                        ev.position.x - content.origin.x,
+                        ev.position.y - content.origin.y,
+                    );
+                    // The same edge ramp a text drag uses, so an item can be
+                    // carried past the visible page of a long list.
+                    if drag_scroll_step(local.y, e.viewport_height) != px(0.) {
+                        e.set_autoscroll(Some(local), cx);
+                    } else {
+                        e.set_autoscroll(None, cx);
+                    }
+                    e.update_grip_target(local.y + e.scroll_top, cx);
+                });
+            }
+        });
+        window.on_mouse_event({
+            let editor = self.editor.clone();
+            move |ev: &MouseUpEvent, phase, _window, cx| {
+                if phase != DispatchPhase::Bubble || ev.button != MouseButton::Left {
+                    return;
+                }
+                editor.update(cx, |e, cx| e.finish_grip_drag(cx));
             }
         });
         // Scrollbar: grab the thumb to drag, or click the track to page.

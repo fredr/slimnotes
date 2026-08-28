@@ -67,6 +67,11 @@ rendered view.
   `==highlight==`, `#tag` pills, bullet/ordered lists, task checkboxes
   (click to toggle), blockquotes, horizontal rules, fenced code blocks with
   syntax highlighting, frontmatter.
+- Reordering and nesting for bullet/task items, each carrying whatever is
+  nested underneath: hover the gutter beside an item for a grip that drags it
+  up or down its list, and press tab / shift-tab to make it a child of the item
+  above or promote it back out. Enter on an empty nested item climbs out one
+  level per press, ending the list at the margin.
 - `[[wikilinks]]` / `[[target|alias]]` (click to open, resolved via the vault
   index) and clickable `[text](url)` links; inline images (`![](path)` and
   Obsidian `![[embed]]`).
