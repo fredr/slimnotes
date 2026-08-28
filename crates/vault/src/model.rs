@@ -35,6 +35,17 @@ pub struct Settings {
     /// exists is ignored rather than treated as an error.
     #[serde(default)]
     pub last_note: HashMap<String, String>,
+    /// Per-vault recently opened notes, most recent first: vault path -> note
+    /// paths. What the note finder lists before anything is typed, so the note
+    /// you were just in is one keystroke away.
+    ///
+    /// The first entry is the same note as `last_note`, deliberately: reopening
+    /// on startup has to keep working for a settings file written before this
+    /// field existed, so `last_note` stays the authority for that and this list
+    /// is only an ordering. Entries naming notes that no longer exist are
+    /// ignored by the reader rather than pruned here.
+    #[serde(default)]
+    pub recent_notes: HashMap<String, Vec<String>>,
     /// Sidebar width in pixels. Not per-vault: the sidebar is a property of the
     /// window, and a user who has sized it once means it for the app. `None`
     /// means "never resized", so the built-in default applies.

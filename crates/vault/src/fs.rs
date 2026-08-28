@@ -18,6 +18,33 @@ pub fn read_tree(root: &Path) -> Vec<Entry> {
     read_dir_entries(root)
 }
 
+/// Every note in `tree`, as paths relative to `root`, in the depth-first order
+/// [`read_tree`] sorted them — which is the order the sidebar shows.
+///
+/// Pure: [`read_tree`] already walks the whole vault (folders are recursed
+/// unconditionally, and collapsing one in the UI only hides it), so flattening
+/// its result costs no I/O. This is the candidate list the note finder matches
+/// against. Paths are relative because that is what gets matched and shown; the
+/// caller joins `root` back on to open one.
+///
+/// Folders are not included — only notes are openable. An entry whose path is
+/// somehow not under `root` is skipped rather than reported: the tree is built
+/// from `root`, so it cannot happen.
+pub fn note_paths(tree: &[Entry], root: &Path) -> Vec<PathBuf> {
+    fn walk(entries: &[Entry], root: &Path, out: &mut Vec<PathBuf>) {
+        for entry in entries {
+            if entry.is_dir {
+                walk(&entry.children, root, out);
+            } else if let Ok(rel) = entry.path.strip_prefix(root) {
+                out.push(rel.to_path_buf());
+            }
+        }
+    }
+    let mut out = Vec::new();
+    walk(tree, root, &mut out);
+    out
+}
+
 fn read_dir_entries(dir: &Path) -> Vec<Entry> {
     let Ok(rd) = fs::read_dir(dir) else {
         return Vec::new();

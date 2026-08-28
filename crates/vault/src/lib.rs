@@ -15,8 +15,8 @@ mod settings;
 mod watch;
 
 pub use fs::{
-    FileSig, create_folder, create_note, file_sig, move_entry, read_note, read_tree, rename_entry,
-    trash_entry, write_note,
+    FileSig, create_folder, create_note, file_sig, move_entry, note_paths, read_note, read_tree,
+    rename_entry, trash_entry, write_note,
 };
 pub use index::VaultIndex;
 pub use model::{Entry, Settings};
@@ -71,6 +71,40 @@ mod tests {
 
         // No hidden entry anywhere at the top level.
         assert!(tree.iter().all(|e| e.name != ".obsidian"));
+    }
+
+    /// The note finder matches against this list, so its order is the sidebar's
+    /// order and its contents are every note in the vault — including notes in
+    /// folders the user has never expanded, since expansion is only a filter on
+    /// what the tree *shows*.
+    #[test]
+    fn note_paths_flattens_every_note_in_tree_order() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+
+        mkdir(&root.join(".obsidian"));
+        touch(&root.join(".obsidian/config.json"), "{}");
+        touch(&root.join("Projects/deep/Ideas.md"), "i");
+        touch(&root.join("Projects/Alpha.md"), "a");
+        touch(&root.join("Welcome.md"), "w");
+        touch(&root.join("notes.txt"), "not markdown");
+        // An empty folder contributes no candidates at all.
+        mkdir(&root.join("Empty"));
+
+        let paths = note_paths(&read_tree(root), root);
+
+        // Folders first at each level (Empty < Projects), recursed before that
+        // level's own files — so the deepest note comes first and the root
+        // note last. Hidden dirs and non-md files are absent, as is the folder
+        // itself: only notes can be opened.
+        assert_eq!(
+            paths,
+            vec![
+                PathBuf::from("Projects/deep/Ideas.md"),
+                PathBuf::from("Projects/Alpha.md"),
+                PathBuf::from("Welcome.md"),
+            ]
+        );
     }
 
     #[test]
@@ -327,6 +361,15 @@ mod tests {
             last_note: [(
                 "/home/user/vault".to_string(),
                 "/home/user/vault/folder/Note.md".to_string(),
+            )]
+            .into_iter()
+            .collect(),
+            recent_notes: [(
+                "/home/user/vault".to_string(),
+                vec![
+                    "/home/user/vault/folder/Note.md".to_string(),
+                    "/home/user/vault/Other.md".to_string(),
+                ],
             )]
             .into_iter()
             .collect(),

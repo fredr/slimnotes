@@ -21,12 +21,13 @@ use slimnotes_editor::{EditorEvent, MarkdownEditor};
 use slimnotes_vault::{self as vault, Entry, FileSig, Settings, VaultIndex, VaultWatcher};
 
 mod cli;
+mod finder;
 mod sidebar;
 
 const CONTEXT: &str = "SlimNotes";
 
-// Save the current note; show/hide the sidebar.
-actions!(slimnotes, [Save, ToggleSidebar]);
+// Save the current note; show/hide the sidebar; open the note finder.
+actions!(slimnotes, [Save, ToggleSidebar, ToggleNoteFinder]);
 
 /// Sidebar width used until the user resizes it.
 const DEFAULT_SIDEBAR_WIDTH: f32 = 240.;
@@ -77,6 +78,10 @@ fn apply_palette(cx: &mut App) {
     t.colors.sidebar_foreground = c(0xb4b4b6);
     t.colors.muted = c(0x2a2a2a);
     t.colors.muted_foreground = c(0x888a8f);
+    // Floating surfaces (the note finder, popup menus, drag previews): a step
+    // lighter than the background, so one reads as sitting above it.
+    t.colors.popover = c(0x262626);
+    t.colors.popover_foreground = c(0xdadada);
     // Panels (code blocks, ghost buttons, subtle hovers)
     t.colors.secondary = c(0x2a2a2a);
     t.colors.secondary_foreground = c(0xdadada);
@@ -91,6 +96,21 @@ fn apply_palette(cx: &mut App) {
     t.colors.ring = c(0x9d86e9);
 }
 
+/// Set the app's chrome — sidebar, header, note finder, popups — in the same
+/// faces the editor renders notes in.
+///
+/// gpui-component defaults to `.SystemUIFont`, which is a different typeface
+/// from the note text right next to it, and which gpui cannot resolve weights
+/// out of: a bold or medium run silently comes back as the regular face (or a
+/// synthesized one). The editor bundles IBM Plex with real weight faces, so
+/// using it here makes the whole window agree and makes emphasis actually work.
+fn apply_fonts(cx: &mut App) {
+    slimnotes_editor::load_fonts(cx);
+    let t = Theme::global_mut(cx);
+    t.font_family = slimnotes_editor::UI_FONT.into();
+    t.mono_font_family = slimnotes_editor::MONO_FONT.into();
+}
+
 fn bind_keys(cx: &mut App) {
     cx.bind_keys([
         #[cfg(target_os = "macos")]
@@ -102,6 +122,20 @@ fn bind_keys(cx: &mut App) {
         KeyBinding::new("cmd-\\", ToggleSidebar, Some(CONTEXT)),
         #[cfg(not(target_os = "macos"))]
         KeyBinding::new("ctrl-\\", ToggleSidebar, Some(CONTEXT)),
+        // The key Zed and VS Code open their file finder with. Pressing it
+        // again closes the finder: it is bound in the app's context, which the
+        // finder sits inside.
+        #[cfg(target_os = "macos")]
+        KeyBinding::new("cmd-p", ToggleNoteFinder, Some(CONTEXT)),
+        #[cfg(not(target_os = "macos"))]
+        KeyBinding::new("ctrl-p", ToggleNoteFinder, Some(CONTEXT)),
+        // The finder's own keys, scoped to its panel. `up`/`down` reach it
+        // through the query field, which leaves them alone while it is a single
+        // line, and `enter`/`escape` are passed along by it deliberately.
+        KeyBinding::new("up", finder::SelectPrev, Some(finder::CONTEXT)),
+        KeyBinding::new("down", finder::SelectNext, Some(finder::CONTEXT)),
+        KeyBinding::new("enter", finder::Confirm, Some(finder::CONTEXT)),
+        KeyBinding::new("escape", finder::Dismiss, Some(finder::CONTEXT)),
     ]);
 }
 
@@ -147,6 +181,8 @@ struct SlimNotes {
     /// A tree row that is currently a text field: naming a new note or folder,
     /// or renaming an existing one.
     edit: Option<sidebar::SidebarEdit>,
+    /// The note finder, while it is open.
+    finder: Option<finder::NoteFinder>,
     /// The file tree's scroll offset, owned here rather than left inside the
     /// element so the sidebar can scroll itself — to a row being named, and
     /// while an entry is dragged towards an edge.
@@ -187,6 +223,7 @@ impl SlimNotes {
             status: None,
             resizing_sidebar: false,
             edit: None,
+            finder: None,
             tree_scroll: ScrollHandle::new(),
             drag_scroll: None,
             drag_scroll_gen: 0,
@@ -209,16 +246,30 @@ impl SlimNotes {
         }
     }
 
-    /// Record the open note as this vault's last note, so a restart reopens it.
+    /// Record the open note as this vault's last note, so a restart reopens it,
+    /// and put it at the head of the vault's recent list, which is what the note
+    /// finder offers before anything is typed.
     fn remember_note(&mut self) {
         let (Some(vault), Some(current)) = (self.vault.as_deref(), self.current.as_deref()) else {
             return;
         };
         let note = current.to_string_lossy().into_owned();
-        let previous = self.settings.last_note.insert(vault_key(vault), note.clone());
-        // Only touch the file when the note actually changed: this runs on every
-        // note switch, and rewriting identical settings buys nothing.
-        if previous.as_deref() != Some(note.as_str()) {
+        let key = vault_key(vault);
+        let previous = self.settings.last_note.insert(key.clone(), note.clone());
+
+        let recent = self.settings.recent_notes.entry(key).or_default();
+        let already_first = recent.first().map(String::as_str) == Some(note.as_str());
+        if !already_first {
+            // Reopening a note moves it up rather than appearing twice.
+            recent.retain(|p| p != &note);
+            recent.insert(0, note.clone());
+            recent.truncate(finder::RECENT_NOTES);
+        }
+        // Only touch the file when something actually changed: this runs on every
+        // note switch, and rewriting identical settings buys nothing. Both halves
+        // are checked because a settings file written before the recent list
+        // existed has a `last_note` and no list to go with it.
+        if previous.as_deref() != Some(note.as_str()) || !already_first {
             self.persist_settings();
         }
     }
@@ -502,6 +553,10 @@ impl SlimNotes {
         self.open_sig = sig;
         self.status = None;
         self.remember_note();
+        // Keep the tree pointing at the note that is open, however it was
+        // reached — the finder and `[[wikilinks]]` can both land somewhere the
+        // sidebar is not showing.
+        self.reveal_note_in_tree();
         cx.notify();
     }
 
@@ -713,6 +768,9 @@ impl Render for SlimNotes {
             .track_focus(&self.focus_handle)
             .on_action(cx.listener(Self::on_save))
             .on_action(cx.listener(Self::on_toggle_sidebar))
+            .on_action(cx.listener(Self::on_toggle_note_finder))
+            // What the note finder's overlay is positioned against.
+            .relative()
             .size_full()
             .bg(bg)
             .text_color(fg);
@@ -729,6 +787,9 @@ impl Render for SlimNotes {
                 .child(self.render_sidebar_divider(cx));
         }
         root = root.child(self.render_content(cx));
+        // Last, so it paints over everything — including, for mouse events,
+        // over the editor's window-wide listeners.
+        root = root.children(self.render_note_finder(cx));
 
         root
     }
@@ -756,6 +817,7 @@ fn main() {
         gpui_component::init(cx);
         Theme::change(ThemeMode::Dark, None, cx);
         apply_palette(cx);
+        apply_fonts(cx);
         bind_keys(cx);
 
         let window_options = WindowOptions {

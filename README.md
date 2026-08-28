@@ -57,7 +57,12 @@ rendered view.
 
 - Vault folder tree (hidden dirs like `.obsidian` skipped), collapse state
   persisted per vault; open/create notes; folder picker; debounced autosave;
-  `Cmd/Ctrl+S`.
+  `Cmd/Ctrl+S`. Right-click a row to rename or delete (deletes go to the vault's
+  `.trash/`), or drag a note or folder to move it.
+- Note finder (`Cmd/Ctrl+P`): fuzzy match over every note path in the vault with
+  the matched characters highlighted, recently opened notes when the query is
+  empty, and an offer to create the note a query names. Opening a note from
+  anywhere reveals it in the tree.
 - Live-preview editing: headings, bold/italic/strikethrough, inline code,
   `==highlight==`, `#tag` pills, bullet/ordered lists, task checkboxes
   (click to toggle), blockquotes, horizontal rules, fenced code blocks with
@@ -80,7 +85,8 @@ rendered view.
   sizes but is the scaling ceiling.
 - IME / marked-text input (dead keys, CJK), a configurable keymap, word-wise and
   page motions.
-- Rename / delete / move, in-app search, light theme.
+- Full-text search over note *contents* (the finder matches paths only), light
+  theme.
 
 ## Versions
 

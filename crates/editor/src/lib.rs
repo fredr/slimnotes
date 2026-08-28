@@ -84,8 +84,11 @@ pub(crate) const CONTENT_PAD: f32 = 32.0;
 // Fonts are bundled (see `fonts/`) and registered at startup, so these families
 // are always present and render identically without system fonts. GPUI's default
 // `.SystemUIFont` doesn't resolve bold/italic faces, hence naming them directly.
-pub(crate) const UI_FONT: &str = "IBM Plex Sans";
-pub(crate) const MONO_FONT: &str = "IBM Plex Mono";
+//
+// Public so a host can dress its own chrome to match the notes it is showing —
+// see [`load_fonts`].
+pub const UI_FONT: &str = "IBM Plex Sans";
+pub const MONO_FONT: &str = "IBM Plex Mono";
 
 // Font sizes (px).
 pub(crate) const BODY_FONT: f32 = 18.0; // body text + non-heading lines
@@ -94,7 +97,12 @@ pub(crate) const CODE_FONT: f32 = 16.0; // fenced code blocks + frontmatter
 static FONTS_LOADED: std::sync::Once = std::sync::Once::new();
 
 /// Register the bundled IBM Plex faces with the text system, once per process.
-fn ensure_fonts(cx: &App) {
+///
+/// Called when an editor is created, so the editor is self-sufficient. A host
+/// that wants [`UI_FONT`] / [`MONO_FONT`] for its own chrome — so the app around
+/// a note is set in the same face as the note — should call this at startup
+/// instead of waiting for the first note to be opened. Idempotent.
+pub fn load_fonts(cx: &App) {
     FONTS_LOADED.call_once(|| {
         macro_rules! face {
             ($f:literal) => {
@@ -201,7 +209,7 @@ impl MarkdownEditor {
     ) -> Self {
         let focus_handle = cx.focus_handle();
         focus_handle.focus(window);
-        ensure_fonts(cx);
+        load_fonts(cx);
         bind_default_keys(cx);
         let text: String = content.into();
         let mut this = Self {

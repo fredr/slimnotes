@@ -746,8 +746,8 @@ impl SlimNotes {
     }
 
     /// Follow `old` becoming `new` in everything that remembers a path: the open
-    /// note, the expanded folders, and this vault's saved last note. Entries
-    /// *inside* a renamed folder move with it.
+    /// note, the expanded folders, and this vault's saved last note and recent
+    /// notes. Entries *inside* a renamed folder move with it.
     fn remap_paths(&mut self, old: &Path, new: &Path) {
         let remap = |p: &Path| -> Option<PathBuf> {
             let rest = p.strip_prefix(old).ok()?;
@@ -776,6 +776,19 @@ impl SlimNotes {
             })
             .collect();
         self.expanded = remapped.into_iter().collect();
+
+        // The recent list holds paths too. A stale entry would be dropped by
+        // the finder rather than shown wrongly, but following the rename is what
+        // keeps a note the user just renamed at the top of the list.
+        if let Some(vault) = self.vault.as_deref().map(crate::vault_key) {
+            if let Some(recent) = self.settings.recent_notes.get_mut(&vault) {
+                for note in recent.iter_mut() {
+                    if let Some(moved) = remap(Path::new(note)) {
+                        *note = crate::vault_key(&moved);
+                    }
+                }
+            }
+        }
         self.persist_expanded();
     }
 
@@ -851,6 +864,68 @@ impl SlimNotes {
     /// it names has been laid out.
     fn reveal_edit_row(&mut self) {
         if let Some(ix) = self.edit_row_index() {
+            self.tree_scroll.scroll_to_item(ix);
+        }
+    }
+
+    /// Position of `target`'s row in the tree's flat list of rows, or `None` if
+    /// it is inside a collapsed folder and so has no row at all.
+    ///
+    /// Walks in the same order as [`Self::edit_row_index`], which is
+    /// [`Self::render_tree`]'s order — change one and all three have to agree.
+    /// There is no edit row to account for here: opening a note abandons any
+    /// half-typed name first.
+    fn note_row_index(&self, target: &Path) -> Option<usize> {
+        fn walk(
+            this: &SlimNotes,
+            entries: &[Entry],
+            target: &Path,
+            next: &mut usize,
+        ) -> Option<usize> {
+            for entry in entries {
+                if entry.path == target {
+                    return Some(*next);
+                }
+                *next += 1;
+                if entry.is_dir && this.expanded.contains(&crate::vault_key(&entry.path)) {
+                    if let Some(found) = walk(this, &entry.children, target, next) {
+                        return Some(found);
+                    }
+                }
+            }
+            None
+        }
+        walk(self, &self.tree, target, &mut 0)
+    }
+
+    /// Show the open note in the tree: expand the folders above it and scroll
+    /// its row into view.
+    ///
+    /// A note can be opened from somewhere other than the tree — the finder, a
+    /// `[[wikilink]]`, or the note restored at startup — and a selected row that
+    /// is folded away or below the fold tells the user nothing about where they
+    /// are.
+    pub(crate) fn reveal_note_in_tree(&mut self) {
+        let (Some(root), Some(path)) = (self.vault.clone(), self.current.clone()) else {
+            return;
+        };
+        if !path.starts_with(&root) {
+            return; // not in this vault, so it has no row to reveal
+        }
+        // Every folder between the vault root and the note, exclusive of both.
+        let mut added = false;
+        for dir in path.ancestors().skip(1).take_while(|d| *d != root) {
+            added |= self.expanded.insert(crate::vault_key(dir));
+        }
+        // Writing the settings file is the expensive part, and opening a note in
+        // a folder that is already open changes nothing to write.
+        if added {
+            self.persist_expanded();
+        }
+        // Requested rather than performed: the rows of a folder expanded just
+        // now are not in the layout yet, and `scroll_to_item` waits for the
+        // frame in which the index it names has been laid out.
+        if let Some(ix) = self.note_row_index(&path) {
             self.tree_scroll.scroll_to_item(ix);
         }
     }
