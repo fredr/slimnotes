@@ -8,12 +8,14 @@
 //! All I/O here is synchronous; the app is expected to call it on a background
 //! executor.
 
+mod attach;
 mod fs;
 mod index;
 mod model;
 mod settings;
 mod watch;
 
+pub use attach::{CONFIG_DIR, attachment_dir, import_attachment, pasted_image_stem, save_attachment};
 pub use fs::{
     FileSig, create_folder, create_note, file_sig, move_entry, note_paths, read_note, read_tree,
     rename_entry, trash_entry, write_note,

@@ -99,6 +99,13 @@ pub fn read_note(path: &Path) -> io::Result<String> {
 /// destination in place, so a crash mid-write can't corrupt the note. Failures
 /// are returned so the caller can surface them.
 pub fn write_note(path: &Path, content: &str) -> io::Result<()> {
+    write_atomic(path, content.as_bytes())
+}
+
+/// The atomic write itself, over raw bytes: temp file in the target's own
+/// directory (so the rename stays on one filesystem), flushed, then renamed
+/// over the target. Shared with the attachment writer.
+pub(crate) fn write_atomic(path: &Path, bytes: &[u8]) -> io::Result<()> {
     let parent = path.parent().unwrap_or_else(|| Path::new("."));
     fs::create_dir_all(parent)?;
 
@@ -106,7 +113,7 @@ pub fn write_note(path: &Path, content: &str) -> io::Result<()> {
     // Best-effort cleanup on any error path below.
     let result = (|| {
         let mut f = fs::File::create(&tmp)?;
-        f.write_all(content.as_bytes())?;
+        f.write_all(bytes)?;
         f.sync_all()?;
         drop(f);
         fs::rename(&tmp, path)

@@ -212,7 +212,11 @@ impl MarkdownEditor {
             };
             Copy                => false, |this, c| this.copy(c);
             Cut                 => true,  |this, c| this.cut(c);
-            Paste               => true,  |this, c| this.paste(c);
+            // Also decides for itself: an image paste puts nothing in the buffer
+            // until the host has stored the file (see `EditorEvent::AddImages`).
+            Paste               => false, |this, c| if this.paste(c) {
+                c.emit(crate::EditorEvent::Changed)
+            };
             Undo                => true,  |this, _c| this.undo();
             Redo                => true,  |this, _c| this.redo();
             SelectAll           => false, |this, _c| this.select_all();

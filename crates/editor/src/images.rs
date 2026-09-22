@@ -4,7 +4,7 @@ use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
-use gpui::RenderImage;
+use gpui::{ImageFormat, RenderImage};
 
 /// An image referenced on its own line: a markdown path or an Obsidian embed.
 pub(crate) enum ImageRef {
@@ -33,7 +33,32 @@ pub(crate) fn parse_image_line(line: &str) -> Option<ImageRef> {
     Some(ImageRef::Rel(path.to_string()))
 }
 
-const IMAGE_EXTS: [&str; 6] = ["png", "jpg", "jpeg", "gif", "webp", "bmp"];
+/// The image file types the editor can decode and draw. Doubles as the filter
+/// for files dragged onto a note, so what is accepted is what will render.
+const IMAGE_EXTS: [&str; 8] = ["png", "jpg", "jpeg", "gif", "webp", "bmp", "tif", "tiff"];
+
+/// Whether `path` names one of those.
+pub(crate) fn is_image_path(path: &Path) -> bool {
+    path.extension()
+        .and_then(|e| e.to_str())
+        .is_some_and(|e| IMAGE_EXTS.contains(&e.to_lowercase().as_str()))
+}
+
+/// The file extension to store a clipboard image under, or `None` for a format
+/// the editor can't draw — better to leave such a paste alone than to write a
+/// file into the vault and embed it as a line that renders as raw text.
+pub(crate) fn clipboard_image_ext(format: ImageFormat) -> Option<&'static str> {
+    Some(match format {
+        ImageFormat::Png => "png",
+        ImageFormat::Jpeg => "jpg",
+        ImageFormat::Webp => "webp",
+        ImageFormat::Gif => "gif",
+        ImageFormat::Bmp => "bmp",
+        ImageFormat::Tiff => "tiff",
+        // The `image` crate has no SVG decoder.
+        ImageFormat::Svg => return None,
+    })
+}
 
 /// Walk the vault once, mapping each image file's lowercased basename to its
 /// path (shortest path wins on collision, matching Obsidian's preference).
@@ -53,12 +78,7 @@ pub(crate) fn build_vault_index(vault: Option<&Path>) -> HashMap<String, PathBuf
                 stack.push(path);
                 continue;
             }
-            let is_image = path
-                .extension()
-                .and_then(|e| e.to_str())
-                .map(|e| IMAGE_EXTS.contains(&e.to_lowercase().as_str()))
-                .unwrap_or(false);
-            if !is_image {
+            if !is_image_path(&path) {
                 continue;
             }
             let key = name.to_lowercase();

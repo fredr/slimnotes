@@ -21,9 +21,10 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use gpui::{
-    anchored, deferred, div, point, px, rgb, size, App, Bounds, ClipboardItem, Context,
-    EntityInputHandler, EventEmitter, FocusHandle, InteractiveElement, IntoElement, ParentElement,
-    Pixels, Point, Render, RenderImage, SharedString, Styled, UTF16Selection, Window,
+    anchored, deferred, div, point, px, rgb, rgba, size, App, Bounds, ClipboardEntry,
+    ClipboardItem, Context, EntityInputHandler, EventEmitter, ExternalPaths, FocusHandle,
+    InteractiveElement, IntoElement, ParentElement, Pixels, Point, Render, RenderImage,
+    SharedString, Styled, UTF16Selection, Window,
 };
 
 mod buffer;
@@ -54,6 +55,26 @@ pub enum EditorEvent {
     Changed,
     /// A `[[wikilink]]` was clicked; the host should open the named note.
     OpenNote(String),
+    /// Images were pasted or dropped onto the note. The editor does not write to
+    /// the vault, so the host stores them and reports the file names back via
+    /// [`MarkdownEditor::insert_image_embeds`], which is what puts them in the
+    /// text. The caret is already where they should land.
+    ///
+    /// Shared rather than owned so forwarding the payload to a background task
+    /// doesn't copy what may be many megabytes of image.
+    AddImages(Arc<Vec<ImageSource>>),
+}
+
+/// An image on its way into a note, before it has a home in the vault.
+pub enum ImageSource {
+    /// Encoded image bytes off the clipboard, with the extension for the format
+    /// they are in.
+    Clipboard {
+        ext: &'static str,
+        bytes: Vec<u8>,
+    },
+    /// An image file dragged in from outside the app.
+    File(PathBuf),
 }
 
 pub(crate) const TEXT: u32 = 0xdcddde;
@@ -69,10 +90,10 @@ pub(crate) const HIGHLIGHT_BG: u32 = 0xd6c04a; // ==highlight== background (high
 pub(crate) const HIGHLIGHT_FG: u32 = 0x1e1e1e; // dark text on the highlight
 pub(crate) const TAG_BG: u32 = 0x9d86e933; // #tag pill background (translucent accent)
 pub(crate) const GRIP_BAND: u32 = 0x9d86e91a; // the rows of a list item being dragged
+pub(crate) const DROP_TINT: u32 = 0x9d86e926; // wash over the page while files are dragged onto it
 pub(crate) const SCROLLBAR: u32 = 0x6e6e6e66; // overlay thumb, idle (translucent grey)
 pub(crate) const SCROLLBAR_HOVER: u32 = 0x9a9a9acc; // thumb while hovered or dragged
 
-pub(crate) const IMAGE_MAX_H: f32 = 400.0; // cap rendered image height (px)
 pub(crate) const IMAGE_PAD: f32 = 6.0; // vertical breathing room around an image (px)
 pub(crate) const QUOTE_INDENT: f32 = 22.0; // left indent per blockquote nesting level (px)
 
@@ -193,6 +214,11 @@ pub struct MarkdownEditor {
     /// Pointer is over the scrollbar strip (or dragging it) — drawn brighter.
     pub(crate) scrollbar_hover: bool,
     pub(crate) layout: Option<Rc<Layout>>, // last painted layout, for movement + hit-testing
+    /// The rect the last frame painted the text into, in window coordinates.
+    /// Hit-testing normally happens inside the element, which has the bounds in
+    /// hand; a file drop arrives on the view instead, so the rect is published
+    /// here for it. `None` before the first paint.
+    pub(crate) content_rect: Option<Bounds<Pixels>>,
     pub(crate) focus_handle: FocusHandle,
     base_dir: Option<PathBuf>,  // note folder, for resolving relative image paths
     vault_dir: Option<PathBuf>, // vault root, for resolving ![[wikilink]] embeds
@@ -249,6 +275,7 @@ impl MarkdownEditor {
             autoscroll: None,
             autoscroll_gen: 0,
             layout: None,
+            content_rect: None,
             focus_handle,
             base_dir,
             vault_dir,
@@ -560,15 +587,91 @@ impl MarkdownEditor {
         }
     }
 
-    fn paste(&mut self, cx: &mut Context<Self>) {
-        let Some(s) = cx.read_from_clipboard().and_then(|item| item.text()) else {
-            return;
+    /// Paste. Returns whether the buffer changed — an image paste doesn't touch
+    /// it here, because the host has to store the image first.
+    fn paste(&mut self, cx: &mut Context<Self>) -> bool {
+        let Some(item) = cx.read_from_clipboard() else {
+            return false;
         };
-        if s.is_empty() {
-            return;
+        // An image wins over text alongside it: a screenshot tool commonly offers
+        // both (the text being a file path or a data URL), and the image is what
+        // the user means by pasting a screenshot.
+        let images: Vec<ImageSource> = item
+            .entries()
+            .iter()
+            .filter_map(|entry| match entry {
+                ClipboardEntry::Image(img) => {
+                    clipboard_image_ext(img.format).map(|ext| ImageSource::Clipboard {
+                        ext,
+                        bytes: img.bytes.clone(),
+                    })
+                }
+                ClipboardEntry::String(_) => None,
+            })
+            .collect();
+        if !images.is_empty() {
+            cx.emit(EditorEvent::AddImages(Arc::new(images)));
+            return false;
         }
+        let Some(s) = item.text().filter(|s| !s.is_empty()) else {
+            return false;
+        };
         let range = self.selection().unwrap_or(self.cursor..self.cursor);
         self.edit(range, &s, None);
+        true
+    }
+
+    // ---- images ----
+
+    /// Files dragged onto the note from outside the app. Images are added at the
+    /// drop point; anything else is left alone, so dropping a PDF or a folder
+    /// does nothing rather than something surprising.
+    fn drop_files(&mut self, paths: &[PathBuf], window: &mut Window, cx: &mut Context<Self>) {
+        let images: Vec<ImageSource> = paths
+            .iter()
+            .filter(|p| is_image_path(p))
+            .cloned()
+            .map(ImageSource::File)
+            .collect();
+        if images.is_empty() {
+            return;
+        }
+        // The images land where they were dropped, not where the caret happened
+        // to be. Placing the caret there now is also what the host inserts
+        // against once it has stored them.
+        self.focus_handle.focus(window);
+        if let Some(offset) = self.offset_at_window_point(window.mouse_position()) {
+            self.set_cursor(offset, false);
+        }
+        cx.emit(EditorEvent::AddImages(Arc::new(images)));
+        cx.notify();
+    }
+
+    /// The buffer offset under a point in window coordinates, using the rect the
+    /// last frame painted into. `None` before the first paint.
+    fn offset_at_window_point(&self, p: Point<Pixels>) -> Option<usize> {
+        let (x, y) = content_point(self.content_rect?, self.scroll_top, p);
+        Some(self.layout.as_ref()?.offset_at(x, y))
+    }
+
+    /// Embed images the host has just stored in the vault, at the caret.
+    ///
+    /// Each goes on a line of its own: the renderer only draws an image for a
+    /// line that holds nothing else, so an embed appended to a sentence would
+    /// stay raw text. The caret ends up on a fresh line below the last one.
+    pub fn insert_image_embeds(&mut self, names: &[String], cx: &mut Context<Self>) {
+        if names.is_empty() {
+            return;
+        }
+        // These files did not exist when the basename index was built, so an
+        // embed naming one would resolve to nothing until it is rebuilt.
+        self.vault_index = None;
+        let insert = embed_block(&self.text, self.cursor, names);
+        let range = self.selection().unwrap_or(self.cursor..self.cursor);
+        self.edit(range, &insert, None);
+        self.scroll_to_caret = true;
+        cx.emit(EditorEvent::Changed);
+        cx.notify();
     }
 
     fn select_all(&mut self) {
@@ -1245,6 +1348,24 @@ impl MarkdownEditor {
     }
 }
 
+/// The text an image insertion puts in the buffer at `cursor`: one `![[name]]`
+/// per line, preceded by a line break when the caret sits after text (the
+/// renderer only draws an image for a line that holds nothing else) and followed
+/// by one, so the caret ends up below the last image.
+fn embed_block(text: &str, cursor: usize, names: &[String]) -> String {
+    let line = offset_to_line_col(text, cursor).0;
+    let mut out = String::new();
+    if !text[line_start(text, line)..cursor].trim().is_empty() {
+        out.push('\n');
+    }
+    for name in names {
+        out.push_str("![[");
+        out.push_str(name);
+        out.push_str("]]\n");
+    }
+    out
+}
+
 impl Render for MarkdownEditor {
     fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         // Printable characters arrive through the platform input handler (see the
@@ -1255,7 +1376,14 @@ impl Render for MarkdownEditor {
             .bg(rgb(BG))
             .text_color(rgb(TEXT))
             .track_focus(&self.focus_handle)
-            .key_context(input::CONTEXT);
+            .key_context(input::CONTEXT)
+            // Files dragged in from the desktop. The whole editor is the target
+            // (the drop point picks the insertion spot), and the tint is the
+            // only signal the user gets that letting go will do something.
+            .drag_over::<ExternalPaths>(|style, _, _, _| style.bg(rgba(DROP_TINT)))
+            .on_drop(cx.listener(|this, paths: &ExternalPaths, window, cx| {
+                this.drop_files(paths.paths(), window, cx);
+            }));
         // No padding here: the element takes the full window rect so the overlay
         // scrollbar can sit at the very edge, and insets the text itself by
         // `CONTENT_PAD`.
@@ -1834,6 +1962,30 @@ mod tests {
         assert!(!checkbox_render(line, Some(5)).unwrap().2);
         // First text column (6) is past the prefix -> glyph stays.
         assert!(checkbox_render(line, Some(6)).unwrap().2);
+    }
+
+    #[test]
+    fn embeds_go_on_their_own_line() {
+        let n = |s: &str| vec![s.to_string()];
+        // Caret after text: broken onto a fresh line first.
+        assert_eq!(embed_block("see this", 8, &n("a.png")), "\n![[a.png]]\n");
+        // Caret on an empty line, or at the start of one: no leading break.
+        assert_eq!(embed_block("", 0, &n("a.png")), "![[a.png]]\n");
+        assert_eq!(embed_block("hi\n", 3, &n("a.png")), "![[a.png]]\n");
+        // Whitespace alone isn't "text" — `parse_image_line` trims, so an
+        // indented embed still renders and needs no break.
+        assert_eq!(embed_block("  \n", 2, &n("a.png")), "![[a.png]]\n");
+        // A list marker *is* text: `- ![[a.png]]` would not render as an image,
+        // so the embed drops below the item.
+        assert_eq!(embed_block("- \n", 2, &n("a.png")), "\n![[a.png]]\n");
+        // Caret mid-line: the break splits it, and the trailing newline keeps the
+        // rest of the line off the image's line too.
+        assert_eq!(embed_block("ab", 1, &n("a.png")), "\n![[a.png]]\n");
+        // Several images, one per line.
+        assert_eq!(
+            embed_block("", 0, &["a.png".to_string(), "b.png".to_string()]),
+            "![[a.png]]\n![[b.png]]\n"
+        );
     }
 
     #[test]

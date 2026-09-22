@@ -74,7 +74,13 @@ rendered view.
   level per press, ending the list at the margin.
 - `[[wikilinks]]` / `[[target|alias]]` (click to open, resolved via the vault
   index) and clickable `[text](url)` links; inline images (`![](path)` and
-  Obsidian `![[embed]]`).
+  Obsidian `![[embed]]`), scaled to fit the page width and never upscaled past
+  their own size.
+- Adding images: paste one from the clipboard, or drag image files onto the note
+  from a file manager (they land where you drop them). The file is stored in the
+  vault's attachment folder and embedded as `![[name.png]]`; a file already
+  inside the vault is embedded where it lies rather than copied. See
+  [Per-vault settings](#per-vault-settings) for where attachments go.
 - Tables: always rendered (never dumped as raw), edit text directly in cells,
   right-click a cell for add/delete row/column.
 - Soft-wrap with hanging indent, wrap-aware vertical movement, selection,
@@ -92,6 +98,30 @@ rendered view.
   page motions.
 - Full-text search over note *contents* (the finder matches paths only), light
   theme.
+
+## Per-vault settings
+
+Optional, and never written by slimnotes: create `<vault>/.slimnotes/settings.json`
+to override a default for one vault. The folder is hidden, so it stays out of the
+note tree and the filesystem watcher.
+
+```json
+{ "attachment_folder_path": "attachments" }
+```
+
+`attachment_folder_path` is where pasted and dropped images are stored, spelled
+the way Obsidian spells it, so a value copied from an Obsidian vault means the
+same thing:
+
+| value           | folder                        |
+|-----------------|-------------------------------|
+| `"/"`           | the vault root                |
+| `"./"`          | the note's own folder         |
+| `"./assets"`    | `assets` beside the note      |
+| `"assets"`      | `assets` under the vault root |
+
+Unset, it is `attachments` under the vault root — Obsidian's own default is the
+vault root, which scatters image files among the notes.
 
 ## Versions
 

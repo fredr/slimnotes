@@ -4,6 +4,7 @@
 use std::collections::HashSet;
 use std::path::{Path, PathBuf};
 use std::rc::Rc;
+use std::sync::Arc;
 use std::time::Duration;
 
 use gpui::{
@@ -17,7 +18,7 @@ use gpui_component::{
     h_flex, v_flex, ActiveTheme, IconName, Root, Sizable, Theme, ThemeMode,
 };
 use gpui_component_assets::Assets;
-use slimnotes_editor::{EditorEvent, MarkdownEditor};
+use slimnotes_editor::{EditorEvent, ImageSource, MarkdownEditor};
 use slimnotes_vault::{self as vault, Entry, FileSig, Settings, VaultIndex, VaultWatcher};
 
 mod cli;
@@ -545,6 +546,7 @@ impl SlimNotes {
             |this, _editor, event: &EditorEvent, window, cx| match event {
                 EditorEvent::Changed => this.schedule_save(cx),
                 EditorEvent::OpenNote(name) => this.open_note_by_name(name, window, cx),
+                EditorEvent::AddImages(images) => this.add_images(images.clone(), cx),
             },
         );
         self.editor = Some(editor);
@@ -558,6 +560,38 @@ impl SlimNotes {
         // sidebar is not showing.
         self.reveal_note_in_tree();
         cx.notify();
+    }
+
+    /// Store images pasted or dropped into the note, then embed them.
+    ///
+    /// The editor has already put the caret where they belong and does not touch
+    /// the buffer until the files exist, so the insertion happens here once the
+    /// write is done. That write runs on the background executor: a dropped file
+    /// can be large, and typing must not stall behind it.
+    fn add_images(&mut self, images: Arc<Vec<ImageSource>>, cx: &mut Context<Self>) {
+        let (Some(vault), Some(current), Some(editor)) =
+            (self.vault.clone(), self.current.clone(), self.editor.clone())
+        else {
+            self.status = Some("Open a note in a vault to add images".to_string());
+            cx.notify();
+            return;
+        };
+        let note_dir = current.parent().unwrap_or(&vault).to_path_buf();
+        cx.spawn(async move |this, cx| {
+            let (names, error) = cx
+                .background_executor()
+                .spawn(async move { store_images(&vault, &note_dir, &images) })
+                .await;
+            editor
+                .update(cx, |editor, cx| editor.insert_image_embeds(&names, cx))
+                .ok();
+            this.update(cx, |this, cx| {
+                this.status = error;
+                cx.notify();
+            })
+            .ok();
+        })
+        .detach();
     }
 
     /// Open a note by its `[[wikilink]]` name, resolved across the vault.
@@ -757,6 +791,40 @@ impl SlimNotes {
             .child(body)
             .into_any_element()
     }
+}
+
+/// Put each image in the vault's attachment folder, returning the file names to
+/// embed and the first failure's message, if any. Pure filesystem work, called
+/// from the background executor.
+fn store_images(
+    vault: &Path,
+    note_dir: &Path,
+    images: &[ImageSource],
+) -> (Vec<String>, Option<String>) {
+    let dir = vault::attachment_dir(vault, note_dir);
+    let mut names = Vec::new();
+    let mut error = None;
+    for image in images {
+        let stored = match image {
+            ImageSource::Clipboard { ext, bytes } => {
+                vault::save_attachment(&dir, &vault::pasted_image_stem(), ext, bytes)
+            }
+            // A file already in the vault is embedded where it lies — dragging a
+            // note's own image around shouldn't quietly duplicate it.
+            ImageSource::File(src) if src.starts_with(vault) => Ok(src.clone()),
+            ImageSource::File(src) => vault::import_attachment(&dir, src),
+        };
+        match stored {
+            // The embed resolves by basename, vault-wide, so that is all it needs.
+            Ok(path) => names.extend(path.file_name().map(|n| n.to_string_lossy().into_owned())),
+            Err(e) => {
+                if error.is_none() {
+                    error = Some(format!("Could not add image: {e}"));
+                }
+            }
+        }
+    }
+    (names, error)
 }
 
 impl Render for SlimNotes {

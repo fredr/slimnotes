@@ -273,6 +273,23 @@ pub(crate) fn content_rect(bounds: Bounds<Pixels>) -> Bounds<Pixels> {
     }
 }
 
+/// Map a pointer position in window space into the text layout's coordinates:
+/// x measured from the content box's left edge, y from the top of the *document*
+/// (so it can be handed straight to `Layout::offset_at`).
+///
+/// Both are clamped into the content box, which is what makes a click or a drop
+/// in the margins read as the nearest edge of the text rather than as a miss —
+/// the padding is part of the page.
+pub(crate) fn content_point(
+    content: Bounds<Pixels>,
+    scroll_top: Pixels,
+    p: Point<Pixels>,
+) -> (Pixels, Pixels) {
+    let x = (p.x - content.origin.x).clamp(px(0.), content.size.width);
+    let y = (p.y - content.origin.y).clamp(px(0.), content.size.height) + scroll_top;
+    (x, y)
+}
+
 /// Which source lines must be shaped for this frame: the visible window plus an
 /// overscan margin, so ordinary scrolling doesn't need to shape anything new.
 pub(crate) fn shape_window(
@@ -356,6 +373,10 @@ impl EditorElement {
         let (marked, grip_line, grip_held) = self.editor.update(cx, |e, _| {
             e.scroll_top = scroll_top;
             e.scroll_to_caret = false;
+            // Published for hit-testing outside a paint, where the element's
+            // bounds aren't in hand — a file dropped on the editor is delivered
+            // to the host view, not to this element (see `drop_files`).
+            e.content_rect = Some(content);
             // Every prepaint path ends here, so this is the one place the frame's
             // viewport height and scrollbar track are published — they can never
             // go stale, not even on the reuse path (a height-only resize rebuilds
@@ -714,13 +735,16 @@ impl EditorElement {
             }
         }
 
-        // Fit an image to the editor width (never upscaling), capped in height.
+        // Fit an image to the editor width, never upscaling past its natural
+        // size — the rule Obsidian uses. Deliberately no height cap: one used to
+        // be applied here, and because a screenshot is usually taller than it is
+        // wide relative to the page, it was what decided the size of virtually
+        // every image, shrinking each one to a fraction of the available width.
+        // A tall image is simply tall; the page scrolls.
         let image = image.map(|data| {
-            let iw = data.size(0).width.0 as f32;
+            let iw = (data.size(0).width.0 as f32).max(1.0);
             let ih = data.size(0).height.0 as f32;
-            let scale = (f32::from(ctx.wrap_width) / iw)
-                .min(1.0)
-                .min(IMAGE_MAX_H / ih.max(1.0));
+            let scale = (f32::from(ctx.wrap_width) / iw).min(1.0);
             (data, size(px(iw * scale), px(ih * scale)))
         });
         let height = match &image {
@@ -1621,12 +1645,9 @@ impl Element for EditorElement {
                     }
                     let Some(layout) = e.layout.clone() else { return };
                     // A click in the margins is treated as a click on the nearest
-                    // edge of the text: clamping x/y into the content box lands it
-                    // at the start/end of the nearest visible line.
-                    let x = (ev.position.x - content.origin.x).clamp(px(0.), content.size.width);
-                    let content_y = (ev.position.y - content.origin.y)
-                        .clamp(px(0.), content.size.height)
-                        + e.scroll_top;
+                    // edge of the text (`content_point` clamps), landing it at the
+                    // start/end of the nearest visible line.
+                    let (x, content_y) = content_point(content, e.scroll_top, ev.position);
                     // ...but a margin click must not *activate* anything. A
                     // checkbox at the start of its line sits within a few px of
                     // the content edge, so a clamped click would land inside its
