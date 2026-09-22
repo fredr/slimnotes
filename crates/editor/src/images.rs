@@ -7,22 +7,43 @@ use std::sync::Arc;
 use gpui::{ImageFormat, RenderImage};
 
 /// An image referenced on its own line: a markdown path or an Obsidian embed.
+#[derive(Debug, PartialEq)]
 pub(crate) enum ImageRef {
     Rel(String),   // ![alt](path) — relative to the note folder
     Embed(String), // ![[name]] — resolved vault-wide by filename
 }
 
+/// The display size an embed asks for, in logical pixels. `height: None` is
+/// Obsidian's `|width` form, where the height follows the aspect ratio.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub(crate) struct ImageSize {
+    pub(crate) width: f32,
+    pub(crate) height: Option<f32>,
+}
+
+/// An image line: what to draw, and how big the note asks for it.
+#[derive(Debug, PartialEq)]
+pub(crate) struct ImageEmbed {
+    pub(crate) target: ImageRef,
+    pub(crate) size: Option<ImageSize>,
+}
+
 /// If a line is solely an image — markdown `![alt](path)` or Obsidian
-/// `![[name.png]]` (optionally `![[name.png|size]]`) — return its reference.
-pub(crate) fn parse_image_line(line: &str) -> Option<ImageRef> {
+/// `![[name.png]]` — return what it points at, plus any `|size` it carries.
+pub(crate) fn parse_image_line(line: &str) -> Option<ImageEmbed> {
     let t = line.trim();
-    // Obsidian embed.
+    // Obsidian embed: `![[name]]`, `![[name|300]]`, `![[name|alt|300x200]]`.
     if let Some(rest) = t.strip_prefix("![[") {
         let inner = rest.strip_suffix("]]")?;
-        let name = inner.split('|').next()?.trim(); // drop |size / |alt
-        return (!name.is_empty()).then(|| ImageRef::Embed(name.to_string()));
+        let (name, rest) = inner.split_once('|').unwrap_or((inner, ""));
+        let name = name.trim();
+        return (!name.is_empty()).then(|| ImageEmbed {
+            target: ImageRef::Embed(name.to_string()),
+            size: trailing_size(rest),
+        });
     }
-    // Markdown image.
+    // Markdown image. Obsidian puts the size in the alt text here — `![|300]`,
+    // `![a cat|300x200]` — so the same trailing-segment rule applies.
     let t = t.strip_prefix("![")?;
     let close = t.find("](")?;
     let inside = t[close + 2..].strip_suffix(')')?;
@@ -30,7 +51,39 @@ pub(crate) fn parse_image_line(line: &str) -> Option<ImageRef> {
     if path.is_empty() || path.starts_with("http://") || path.starts_with("https://") {
         return None;
     }
-    Some(ImageRef::Rel(path.to_string()))
+    Some(ImageEmbed {
+        target: ImageRef::Rel(path.to_string()),
+        size: trailing_size(&t[..close]),
+    })
+}
+
+/// The size in the last `|`-separated segment of `spec`, if that segment is one.
+/// Everything before it — and a last segment that isn't a size — is alt text or
+/// a caption, which this renderer has nowhere to put and so ignores.
+fn trailing_size(spec: &str) -> Option<ImageSize> {
+    let last = spec.rsplit('|').next()?.trim();
+    // Obsidian writes `300` (width only) or `300x200`.
+    let (w, h) = match last.split_once(['x', 'X']) {
+        Some((w, h)) => (w, Some(h)),
+        None => (last, None),
+    };
+    // A malformed height (`300xbig`) makes the whole thing alt text, not a
+    // width of 300 — the note asked for something this doesn't understand.
+    let height = match h {
+        Some(h) => Some(dimension(h)?),
+        None => None,
+    };
+    Some(ImageSize { width: dimension(w)?, height })
+}
+
+/// A positive whole number of pixels. Deliberately strict — anything else is
+/// alt text that happens to sit in the last segment, not a size.
+fn dimension(s: &str) -> Option<f32> {
+    let s = s.trim();
+    if s.is_empty() || !s.bytes().all(|b| b.is_ascii_digit()) {
+        return None;
+    }
+    s.parse::<f32>().ok().filter(|n| *n > 0.)
 }
 
 /// The image file types the editor can decode and draw. Doubles as the filter

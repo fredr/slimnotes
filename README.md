@@ -74,8 +74,11 @@ rendered view.
   level per press, ending the list at the margin.
 - `[[wikilinks]]` / `[[target|alias]]` (click to open, resolved via the vault
   index) and clickable `[text](url)` links; inline images (`![](path)` and
-  Obsidian `![[embed]]`), scaled to fit the page width and never upscaled past
-  their own size.
+  Obsidian `![[embed]]`). An image is drawn at its own size and shrunk to fit
+  the page width; Obsidian's size suffix sets it explicitly — `![[img.png|300]]`
+  for a width (the height follows the aspect ratio) or `![[img.png|300x200]]`
+  for both. A last segment that isn't a size (`![[img.png|a cat]]`) is alt text
+  and leaves the image alone.
 - Adding images: paste one from the clipboard, or drag image files onto the note
   from a file manager (they land where you drop them). The file is stored in the
   vault's attachment folder and embedded as `![[name.png]]`; a file already

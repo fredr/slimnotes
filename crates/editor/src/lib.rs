@@ -1990,13 +1990,45 @@ mod tests {
 
     #[test]
     fn image_line_parsing() {
-        assert!(matches!(parse_image_line("![alt](pic.png)"), Some(ImageRef::Rel(p)) if p == "pic.png"));
-        assert!(matches!(parse_image_line("![[att.png]]"), Some(ImageRef::Embed(n)) if n == "att.png"));
+        let target = |line| parse_image_line(line).map(|e| e.target);
+        assert!(matches!(target("![alt](pic.png)"), Some(ImageRef::Rel(p)) if p == "pic.png"));
+        assert!(matches!(target("![[att.png]]"), Some(ImageRef::Embed(n)) if n == "att.png"));
         // Obsidian size/alt suffix is stripped for resolution.
-        assert!(matches!(parse_image_line("![[att.png|300]]"), Some(ImageRef::Embed(n)) if n == "att.png"));
+        assert!(matches!(target("![[att.png|300]]"), Some(ImageRef::Embed(n)) if n == "att.png"));
         // Remote images and plain text are not treated as image lines.
         assert!(parse_image_line("![x](https://e.com/a.png)").is_none());
         assert!(parse_image_line("just text").is_none());
+    }
+
+    #[test]
+    fn image_size_suffix() {
+        let sz = |line| parse_image_line(line).and_then(|e| e.size);
+        let wh = |w: f32, h: Option<f32>| Some(ImageSize { width: w, height: h });
+
+        // No suffix at all.
+        assert_eq!(sz("![[a.png]]"), None);
+        assert_eq!(sz("![alt](a.png)"), None);
+        // Width alone — height follows the aspect ratio.
+        assert_eq!(sz("![[a.png|300]]"), wh(300., None));
+        assert_eq!(sz("![|300](a.png)"), wh(300., None));
+        // Explicit width and height, either case of the separator.
+        assert_eq!(sz("![[a.png|300x200]]"), wh(300., Some(200.)));
+        assert_eq!(sz("![[a.png|300X200]]"), wh(300., Some(200.)));
+        assert_eq!(sz("![a cat|300x200](a.png)"), wh(300., Some(200.)));
+        // Only the last segment is a size; earlier ones are alt text.
+        assert_eq!(sz("![[a.png|a cat|300]]"), wh(300., None));
+        assert_eq!(sz("![[a.png|300|a cat]]"), None);
+        // Alt text that is not a size leaves the image at its natural size,
+        // rather than being read as one.
+        assert_eq!(sz("![[a.png|a cat]]"), None);
+        assert_eq!(sz("![[a.png|300px]]"), None);
+        assert_eq!(sz("![[a.png|300.5]]"), None);
+        assert_eq!(sz("![[a.png|0]]"), None);
+        assert_eq!(sz("![[a.png|-40]]"), None);
+        // A broken height is not silently dropped back to a width-only size.
+        assert_eq!(sz("![[a.png|300xbig]]"), None);
+        // Whitespace around the numbers is tolerated.
+        assert_eq!(sz("![[a.png| 300 x 200 ]]"), wh(300., Some(200.)));
     }
 
     #[test]

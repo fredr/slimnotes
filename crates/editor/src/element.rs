@@ -584,7 +584,10 @@ impl EditorElement {
 
         // A non-active image line renders the picture in place of its source.
         let image = if !is_cursor_line && !in_block {
-            parse_image_line(line).and_then(|rel| self.editor.update(cx, |e, _| e.image_for(&rel)))
+            parse_image_line(line).and_then(|embed| {
+                let data = self.editor.update(cx, |e, _| e.image_for(&embed.target))?;
+                Some((data, embed.size))
+            })
         } else {
             None
         };
@@ -735,17 +738,26 @@ impl EditorElement {
             }
         }
 
-        // Fit an image to the editor width, never upscaling past its natural
-        // size — the rule Obsidian uses. Deliberately no height cap: one used to
-        // be applied here, and because a screenshot is usually taller than it is
-        // wide relative to the page, it was what decided the size of virtually
-        // every image, shrinking each one to a fraction of the available width.
-        // A tall image is simply tall; the page scrolls.
-        let image = image.map(|data| {
+        // How big to draw an image. An embed's own `|size` is taken as written
+        // — that is the point of asking — and otherwise the picture is shown at
+        // its natural size. Either way it is then fitted to the page width.
+        //
+        // There is deliberately no height cap. One used to be applied here, and
+        // because a screenshot is taller than it is wide relative to the page,
+        // it was what decided the size of virtually every image, shrinking each
+        // one to a fraction of the available width. A tall image is simply tall;
+        // the page scrolls.
+        let image = image.map(|(data, want)| {
             let iw = (data.size(0).width.0 as f32).max(1.0);
-            let ih = data.size(0).height.0 as f32;
-            let scale = (f32::from(ctx.wrap_width) / iw).min(1.0);
-            (data, size(px(iw * scale), px(ih * scale)))
+            let ih = (data.size(0).height.0 as f32).max(1.0);
+            let (w, h) = match want {
+                // `|width` alone keeps the aspect ratio; `|width x height` is
+                // taken literally, stretch and all.
+                Some(s) => (s.width, s.height.unwrap_or(ih * s.width / iw)),
+                None => (iw, ih),
+            };
+            let scale = (f32::from(ctx.wrap_width) / w).min(1.0);
+            (data, size(px(w * scale), px(h * scale)))
         });
         let height = match &image {
             Some((_, sz)) => sz.height + px(IMAGE_PAD * 2.),
