@@ -35,6 +35,7 @@ mod layout;
 mod parse;
 mod reorder;
 mod scrollbar;
+mod search;
 mod segments;
 mod tables;
 
@@ -47,6 +48,7 @@ pub(crate) use layout::*;
 pub(crate) use parse::*;
 pub(crate) use reorder::*;
 pub(crate) use scrollbar::*;
+pub(crate) use search::*;
 pub(crate) use segments::*;
 pub(crate) use tables::*;
 
@@ -91,6 +93,9 @@ pub(crate) const HIGHLIGHT_FG: u32 = 0x1e1e1e; // dark text on the highlight
 pub(crate) const TAG_BG: u32 = 0x9d86e933; // #tag pill background (translucent accent)
 pub(crate) const GRIP_BAND: u32 = 0x9d86e91a; // the rows of a list item being dragged
 pub(crate) const DROP_TINT: u32 = 0x9d86e926; // wash over the page while files are dragged onto it
+pub(crate) const SEARCH_MATCH: u32 = 0x9d86e933; // every ctrl-f match (translucent accent)
+pub(crate) const SEARCH_CURRENT: u32 = 0x9d86e959; // the one the counter points at
+pub(crate) const SEARCH_RING: u32 = 0x9d86e9ff; // and its outline
 pub(crate) const SCROLLBAR: u32 = 0x6e6e6e66; // overlay thumb, idle (translucent grey)
 pub(crate) const SCROLLBAR_HOVER: u32 = 0x9a9a9acc; // thumb while hovered or dragged
 
@@ -243,6 +248,9 @@ pub struct MarkdownEditor {
     pub(crate) grip_hover: Option<usize>,
     /// The list-item drag in flight, if any.
     pub(crate) grip_drag: Option<GripDrag>,
+    /// The find-in-note, while the host's search bar is open. Paint-only: see
+    /// `search.rs`.
+    pub(crate) search: Option<Search>,
 }
 
 impl MarkdownEditor {
@@ -289,6 +297,7 @@ impl MarkdownEditor {
             table_menu: None,
             grip_hover: None,
             grip_drag: None,
+            search: None,
         };
         this.maybe_drag_test(cx);
         this
@@ -300,6 +309,8 @@ impl MarkdownEditor {
         // Line numbers have just moved under it, and the pointer hasn't; the
         // next mouse move recomputes it against the new text.
         self.grip_hover = None;
+        // Every match offset was into the text that has just been replaced.
+        self.refresh_search();
     }
 
     /// Apply a table structural edit (from the context menu) and place the caret
@@ -374,6 +385,12 @@ impl MarkdownEditor {
         &self.text
     }
 
+    /// The selected text, or `None` when the selection is empty. Lets a host
+    /// open the find on whatever the caret is sitting on.
+    pub fn selected_text(&self) -> Option<&str> {
+        self.text.get(self.selection()?)
+    }
+
     /// The caret's byte offset. Exposed for demos that drive the editor with
     /// synthetic keystrokes and check where the caret ends up (see the `keynav`
     /// example).
@@ -409,6 +426,7 @@ impl MarkdownEditor {
         self.layout_reveal = None;
         self.grip_hover = None;
         self.grip_drag = None;
+        self.search = None;
         self.shapes = ShapeCaches::default();
         self.base_dir = base_dir;
         self.vault_dir = vault_dir;
@@ -2332,6 +2350,53 @@ mod tests {
             }
             off = le + 1;
         }
+    }
+
+    #[test]
+    fn find_matches_are_case_insensitive_and_in_order() {
+        let text = "Gateway\nservice gateway\nGATEWAYS";
+        let m = find_matches(text, "gat");
+        assert_eq!(m, vec![0..3, 16..19, 24..27]);
+        // The offsets index the original text, whatever its case.
+        assert_eq!(&text[m[2].clone()], "GAT");
+        // A query nothing says matches nothing, and neither does an empty one —
+        // which is what an emptied field leaves behind.
+        assert!(find_matches(text, "zzz").is_empty());
+        assert!(find_matches(text, "").is_empty());
+    }
+
+    #[test]
+    fn find_matches_do_not_overlap_and_survive_multibyte_text() {
+        // Overlapping occurrences: the scan resumes past the one it took, so
+        // "aaaa" holds two "aa"s rather than three.
+        assert_eq!(find_matches("aaaa", "aa"), vec![0..2, 2..4]);
+        // Byte offsets, not character counts: "é" is two bytes, so the match
+        // after it starts at 3.
+        let text = "é_café";
+        let m = find_matches(text, "CAF");
+        assert_eq!(m, vec![3..6]);
+        assert_eq!(&text[m[0].clone()], "caf");
+        // A needle that is itself multibyte still lands on boundaries.
+        assert_eq!(find_matches("aé b", "É"), vec![1..3]);
+    }
+
+    #[test]
+    fn search_in_yields_only_the_matches_on_the_line() {
+        let all = vec![0..3, 10..13, 20..23, 30..33];
+        let on = |a, b| {
+            search_in(&all, a, b)
+                .map(|(ix, m)| (ix, m.clone()))
+                .collect::<Vec<_>>()
+        };
+        // A line's byte span picks up the matches inside it, each with the index
+        // that says whether it is the current one.
+        assert_eq!(on(10, 24), vec![(1, 10..13), (2, 20..23)]);
+        // Abutting either edge is not touching: a match ending where the line
+        // starts belongs to the line before it.
+        assert_eq!(on(13, 20), vec![]);
+        assert_eq!(on(0, 3), vec![(0, 0..3)]);
+        // An empty span (a blank table cell) can hold nothing.
+        assert_eq!(on(10, 10), vec![]);
     }
 
     #[test]

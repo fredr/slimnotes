@@ -2,14 +2,15 @@
 //! with scrolling, and routes mouse + wheel events back to the editor entity.
 
 use std::collections::HashMap;
+use std::ops::Range;
 use std::rc::Rc;
 
 use gpui::{
     fill, point, px, quad, relative, rgb, rgba, size, transparent_black, App, BorderStyle, Bounds,
     ContentMask, Corners, CursorStyle, DispatchPhase, Element, ElementId, ElementInputHandler,
-    Entity, FontWeight, GlobalElementId, Hitbox, HitboxBehavior, InspectorElementId, IntoElement,
-    LayoutId, MouseButton, MouseDownEvent, MouseMoveEvent, MouseUpEvent, Pixels, ScrollDelta,
-    ScrollWheelEvent, SharedString, Style, TextAlign, TextRun, WrappedLine, Window,
+    Entity, FontWeight, GlobalElementId, Hitbox, HitboxBehavior, Hsla, InspectorElementId,
+    IntoElement, LayoutId, MouseButton, MouseDownEvent, MouseMoveEvent, MouseUpEvent, Pixels,
+    ScrollDelta, ScrollWheelEvent, SharedString, Style, TextAlign, TextRun, WrappedLine, Window,
 };
 
 use crate::*;
@@ -256,6 +257,22 @@ pub(crate) fn resolve_scroll(
     scroll_top.clamp(px(0.), max_scroll)
 }
 
+/// The fill a find match is painted with, and the outline the *current* one gets
+/// on top of it — which is what picks one match out of a page of them.
+fn match_colors(current: bool) -> (Hsla, Option<Hsla>) {
+    if current {
+        (rgba(SEARCH_CURRENT).into(), Some(rgba(SEARCH_RING).into()))
+    } else {
+        (rgba(SEARCH_MATCH).into(), None)
+    }
+}
+
+/// A filled band with an outline: the current find match, which needs to stand
+/// out from the others without a fill dark enough to swallow the text.
+fn band_quad(rect: Bounds<Pixels>, bg: Hsla, ring: Hsla) -> gpui::PaintQuad {
+    quad(rect, Corners::all(px(2.)), bg, px(1.), ring, BorderStyle::Solid)
+}
+
 /// The text area: the element's rect inset by [`CONTENT_PAD`] on all four sides.
 ///
 /// The element spans the whole window so the overlay scrollbar can hug the right
@@ -335,6 +352,11 @@ pub(crate) struct Prepaint {
     selection: Option<(usize, usize)>,
     /// The IME preedit range, underlined while composing.
     marked: Option<(usize, usize)>,
+    /// The find's matches and which of them is current, while the search bar is
+    /// open and matching something. Read here rather than threaded through the
+    /// three prepaint paths: highlighting a match changes nothing about the
+    /// layout, so it is only ever a paint input.
+    search: Option<(Rc<Vec<Range<usize>>>, usize)>,
     /// Where a click places the caret — the text plus its margins. Gets the
     /// I-beam pointer.
     hitbox: Hitbox,
@@ -370,7 +392,7 @@ impl EditorElement {
         let content = content_rect(bounds);
         let viewport_height = content.size.height;
         let scroll_track = bounds.size.height;
-        let (marked, grip_line, grip_held) = self.editor.update(cx, |e, _| {
+        let (marked, grip_line, grip_held, search) = self.editor.update(cx, |e, _| {
             e.scroll_top = scroll_top;
             e.scroll_to_caret = false;
             // Published for hit-testing outside a paint, where the element's
@@ -384,7 +406,7 @@ impl EditorElement {
             e.viewport_height = viewport_height;
             e.scroll_track = scroll_track;
             let marked = e.marked_range.as_ref().map(|r| (r.start, r.end));
-            (marked, e.grip_hover, e.grip_drag.is_some())
+            (marked, e.grip_hover, e.grip_drag.is_some(), e.search_paint())
         });
         // Pointer regions. Hitboxes may only be created during prepaint, and
         // `scroll_top` is final by the time we get here, so this is the only
@@ -441,6 +463,7 @@ impl EditorElement {
             cursor,
             selection,
             marked,
+            search,
             hitbox,
             hands,
             grip,
@@ -1248,12 +1271,16 @@ impl Element for EditorElement {
                 window.paint_quad(fill(rect, rgb(MUTED)));
             }
 
-            // Selection background (per wrapped row). Painted *after* the line's
-            // run backgrounds (see below) so it shows over inline-code/highlight
-            // backgrounds, which are opaque; hence a closure invoked at the right
-            // point in each text-paint path rather than here.
-            let paint_selection = |win: &mut Window| {
-                let Some((ss, se)) = prepaint.selection else { return };
+            // A band behind a document byte range, one quad per wrapped row it
+            // covers — how both the selection and the find's matches are drawn.
+            // Painted *after* the line's run backgrounds (see below) so it shows
+            // over inline-code/highlight backgrounds, which are opaque; hence a
+            // closure invoked at the right point in each text-paint path rather
+            // than here.
+            let paint_band = |win: &mut Window,
+                              (ss, se): (usize, usize),
+                              bg: Hsla,
+                              ring: Option<Hsla>| {
                 let Some(wrapped) = line.wrapped.as_ref() else { return };
                 let (ls, le) = (line.start, line.start + line.source.len());
                 if se > ls && ss < le {
@@ -1269,7 +1296,10 @@ impl Element for EditorElement {
                             origin: point(content.origin.x + x0 + shift, screen_top + row_y),
                             size: size((x1 - x0).max(px(3.)), lh),
                         };
-                        win.paint_quad(fill(rect, rgb(SELECTION)));
+                        win.paint_quad(match ring {
+                            Some(ring) => band_quad(rect, bg, ring),
+                            None => fill(rect, bg),
+                        });
                     };
                     if pa.y == pb.y {
                         paint_row(win, pa.x, pb.x, pa.y);
@@ -1282,6 +1312,20 @@ impl Element for EditorElement {
                         }
                         paint_row(win, px(0.), pb.x, pb.y);
                     }
+                }
+            };
+
+            // The find's matches, then the selection over them: a selection is
+            // the thing the user is holding, so it wins where they overlap.
+            let paint_highlights = |win: &mut Window| {
+                if let Some((matches, current)) = &prepaint.search {
+                    for (ix, m) in search_in(matches, line.start, line.start + line.source.len()) {
+                        let (bg, ring) = match_colors(ix == *current);
+                        paint_band(win, (m.start, m.end), bg, ring);
+                    }
+                }
+                if let Some(sel) = prepaint.selection {
+                    paint_band(win, sel, rgb(SELECTION).into(), None);
                 }
             };
 
@@ -1326,7 +1370,7 @@ impl Element for EditorElement {
 
             // Horizontal rule: a thin centered line across the content width.
             if line.hr {
-                paint_selection(window);
+                paint_highlights(window);
                 paint_marked(window);
                 let rect = Bounds {
                     origin: point(content.origin.x, screen_top + line.height / 2. - px(1.)),
@@ -1356,11 +1400,39 @@ impl Element for EditorElement {
                     // paint_background draws inline code/highlight run backgrounds
                     // (ShapedLine::paint only draws glyphs).
                     let _ = cell.shaped.paint_background(text_origin, line.line_height, window, cx);
-                    // Selection. A table row has no `wrapped` line of its own —
-                    // every cell is separately shaped — so the `paint_selection`
-                    // above cannot draw it; each cell highlights itself here.
-                    // After the run backgrounds (which are opaque) so selected
-                    // inline code still reads as selected, and before the glyphs.
+                    // A table row has no `wrapped` line of its own — every cell
+                    // is separately shaped — so the `paint_highlights` above
+                    // cannot draw the find's matches or the selection over it;
+                    // each cell highlights itself here. After the run
+                    // backgrounds (which are opaque) so highlighted inline code
+                    // still reads as highlighted, and before the glyphs.
+                    if let Some((matches, current)) = &prepaint.search {
+                        for (ix, m) in search_in(matches, cell.src_start, cell.src_end) {
+                            let covered =
+                                cell_selection(cell.src_start, cell.src_end, Some((m.start, m.end)));
+                            let (x0, x1) = match covered {
+                                Some(CellSel::Whole) => (cx0 + px(1.), cx0 + cell.width - px(1.)),
+                                Some(CellSel::Part(r)) => {
+                                    let a = cell.shaped.x_for_index(src_to_disp(&cell.segs, r.start));
+                                    let b = cell.shaped.x_for_index(src_to_disp(&cell.segs, r.end));
+                                    (text_origin.x + a, text_origin.x + b)
+                                }
+                                None => continue,
+                            };
+                            let rect = Bounds {
+                                origin: point(x0, screen_top + px(1.)),
+                                size: size(
+                                    (x1 - x0).max(px(3.)),
+                                    (line.height - px(2.)).max(px(0.)),
+                                ),
+                            };
+                            let (bg, ring) = match_colors(ix == *current);
+                            window.paint_quad(match ring {
+                                Some(ring) => band_quad(rect, bg, ring),
+                                None => fill(rect, bg),
+                            });
+                        }
+                    }
                     match cell_selection(cell.src_start, cell.src_end, prepaint.selection) {
                         Some(CellSel::Whole) => {
                             // Inset by the border so the grid stays visible
@@ -1447,7 +1519,7 @@ impl Element for EditorElement {
                 window.with_content_mask(Some(mask0), |w| {
                     let o = point(base_x, screen_top);
                     let _ = wrapped.paint_background(o, lh, TextAlign::Left, None, w, cx);
-                    paint_selection(w);
+                    paint_highlights(w);
                     paint_marked(w);
                     let _ = wrapped.paint(o, lh, TextAlign::Left, None, w, cx);
                 });
@@ -1460,14 +1532,14 @@ impl Element for EditorElement {
                 window.with_content_mask(Some(mask1), |w| {
                     let o = point(base_x + line.hang, screen_top);
                     let _ = wrapped.paint_background(o, lh, TextAlign::Left, None, w, cx);
-                    paint_selection(w);
+                    paint_highlights(w);
                     paint_marked(w);
                     let _ = wrapped.paint(o, lh, TextAlign::Left, None, w, cx);
                 });
             } else {
                 let o = point(base_x, screen_top);
                 let _ = wrapped.paint_background(o, lh, TextAlign::Left, None, window, cx);
-                paint_selection(window);
+                paint_highlights(window);
                 paint_marked(window);
                 let _ = wrapped.paint(o, lh, TextAlign::Left, None, window, cx);
             }

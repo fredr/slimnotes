@@ -23,12 +23,14 @@ use slimnotes_vault::{self as vault, Entry, FileSig, Settings, VaultIndex, Vault
 
 mod cli;
 mod finder;
+mod search;
 mod sidebar;
 
 const CONTEXT: &str = "SlimNotes";
 
-// Save the current note; show/hide the sidebar; open the note finder.
-actions!(slimnotes, [Save, ToggleSidebar, ToggleNoteFinder]);
+// Save the current note; show/hide the sidebar; open the note finder; find
+// within the open note.
+actions!(slimnotes, [Save, ToggleSidebar, ToggleNoteFinder, ToggleSearch]);
 
 /// Sidebar width used until the user resizes it.
 const DEFAULT_SIDEBAR_WIDTH: f32 = 240.;
@@ -137,6 +139,19 @@ fn bind_keys(cx: &mut App) {
         KeyBinding::new("down", finder::SelectNext, Some(finder::CONTEXT)),
         KeyBinding::new("enter", finder::Confirm, Some(finder::CONTEXT)),
         KeyBinding::new("escape", finder::Dismiss, Some(finder::CONTEXT)),
+        // Find within the note, on the key every editor and browser uses for it.
+        #[cfg(target_os = "macos")]
+        KeyBinding::new("cmd-f", ToggleSearch, Some(CONTEXT)),
+        #[cfg(not(target_os = "macos"))]
+        KeyBinding::new("ctrl-f", ToggleSearch, Some(CONTEXT)),
+        // The find bar's own keys, scoped to its row. Enter walks the matches
+        // (shift to go back) and the arrows do the same, since the field is a
+        // single line and leaves them alone.
+        KeyBinding::new("enter", search::FindNext, Some(search::CONTEXT)),
+        KeyBinding::new("shift-enter", search::FindPrev, Some(search::CONTEXT)),
+        KeyBinding::new("down", search::FindNext, Some(search::CONTEXT)),
+        KeyBinding::new("up", search::FindPrev, Some(search::CONTEXT)),
+        KeyBinding::new("escape", search::Dismiss, Some(search::CONTEXT)),
     ]);
 }
 
@@ -184,6 +199,8 @@ struct SlimNotes {
     edit: Option<sidebar::SidebarEdit>,
     /// The note finder, while it is open.
     finder: Option<finder::NoteFinder>,
+    /// The find-in-note bar, while it is open.
+    search: Option<search::NoteSearch>,
     /// The file tree's scroll offset, owned here rather than left inside the
     /// element so the sidebar can scroll itself — to a row being named, and
     /// while an entry is dragged towards an edge.
@@ -225,6 +242,7 @@ impl SlimNotes {
             resizing_sidebar: false,
             edit: None,
             finder: None,
+            search: None,
             tree_scroll: ScrollHandle::new(),
             drag_scroll: None,
             drag_scroll_gen: 0,
@@ -284,6 +302,7 @@ impl SlimNotes {
         self.editor = None;
         self._editor_sub = None;
         self.edit = None;
+        self.discard_search();
     }
 
     /// Rescan the vault tree and rebuild the resolver index on the background
@@ -549,6 +568,9 @@ impl SlimNotes {
                 EditorEvent::AddImages(images) => this.add_images(images.clone(), cx),
             },
         );
+        // The bar was searching the note being replaced, and the new editor
+        // takes focus for itself.
+        self.discard_search();
         self.editor = Some(editor);
         self._editor_sub = Some(sub);
         self.current = Some(path);
@@ -788,6 +810,7 @@ impl SlimNotes {
             .h_full()
             .min_w(px(0.))
             .child(header)
+            .children(self.render_search_bar(cx))
             .child(body)
             .into_any_element()
     }
@@ -837,6 +860,7 @@ impl Render for SlimNotes {
             .on_action(cx.listener(Self::on_save))
             .on_action(cx.listener(Self::on_toggle_sidebar))
             .on_action(cx.listener(Self::on_toggle_note_finder))
+            .on_action(cx.listener(Self::on_toggle_search))
             // What the note finder's overlay is positioned against.
             .relative()
             .size_full()
