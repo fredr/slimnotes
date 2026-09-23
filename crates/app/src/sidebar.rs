@@ -185,7 +185,6 @@ impl SlimNotes {
                     .overflow_y_scroll()
                     .track_scroll(&self.tree_scroll)
                     .px_2()
-                    .pb_4()
                     // Dropping on the tree's empty space moves an entry to the
                     // vault root — otherwise nothing could be dragged back *out*
                     // of a folder. A drop onto a folder row is unaffected: the
@@ -208,8 +207,35 @@ impl SlimNotes {
                             this.drag_scroll(y, e.bounds.size.height, cx);
                         },
                     ))
-                    .children(self.render_tree(&self.tree, &root, 0, cx)),
+                    .children(self.render_tree(&self.tree, &root, 0, cx))
+                    .child(self.render_tree_space(&root, cx)),
             )
+    }
+
+    /// The tree's empty space below its last row, whose context menu creates
+    /// in the vault root the way a folder's creates in that folder.
+    ///
+    /// A row of its own rather than a menu on the whole tree: gpui-component's
+    /// context menu opens for any right-click inside its bounds and cannot be
+    /// stopped by the row that was clicked, so a menu on the tree would open on
+    /// top of every folder and note menu. It is the last row, so the others
+    /// keep their indices for `scroll_to_item`, and it stands in for the tree's
+    /// bottom padding so a tree longer than the sidebar still has some.
+    fn render_tree_space(&self, root: &Path, cx: &mut Context<Self>) -> impl IntoElement {
+        let create = self.create_menu(root, cx);
+        let has_vault = self.vault.is_some();
+        div()
+            .flex_grow()
+            .min_h_4()
+            // Without a vault there is nowhere to create anything, and an empty
+            // menu is not shown at all.
+            .context_menu(move |menu, window, cx| {
+                if has_vault {
+                    create(menu, window, cx)
+                } else {
+                    menu
+                }
+            })
     }
 
     /// A sidebar row's name: truncated with an ellipsis when it does not fit,
@@ -434,6 +460,44 @@ impl SlimNotes {
         )
     }
 
+    /// New note / New folder inside `dir`: the whole menu of the tree's empty
+    /// space, for the vault root, and the start of a folder's.
+    ///
+    /// `use<>` says the builder borrows nothing, which is what lets a caller
+    /// keep using `cx` while it holds one.
+    fn create_menu(
+        &self,
+        dir: &Path,
+        cx: &mut Context<Self>,
+    ) -> impl Fn(
+        gpui_component::menu::PopupMenu,
+        &mut Window,
+        &mut Context<gpui_component::menu::PopupMenu>,
+    ) -> gpui_component::menu::PopupMenu
+    + use<> {
+        let new_note = self.edit_action(
+            EditKind::NewNote {
+                parent: dir.to_path_buf(),
+            },
+            cx,
+        );
+        let new_folder = self.edit_action(
+            EditKind::NewFolder {
+                parent: dir.to_path_buf(),
+            },
+            cx,
+        );
+        move |menu, _, _| {
+            let (new_note, new_folder) = (new_note.clone(), new_folder.clone());
+            menu.item(
+                PopupMenuItem::new("New note").on_click(move |e, w, cx| new_note(e, w, cx)),
+            )
+            .item(
+                PopupMenuItem::new("New folder").on_click(move |e, w, cx| new_folder(e, w, cx)),
+            )
+        }
+    }
+
     /// Rename / Delete, plus creation inside the folder.
     fn folder_menu(
         &self,
@@ -445,18 +509,7 @@ impl SlimNotes {
         &mut Context<gpui_component::menu::PopupMenu>,
     ) -> gpui_component::menu::PopupMenu
     + 'static {
-        let new_note = self.edit_action(
-            EditKind::NewNote {
-                parent: path.to_path_buf(),
-            },
-            cx,
-        );
-        let new_folder = self.edit_action(
-            EditKind::NewFolder {
-                parent: path.to_path_buf(),
-            },
-            cx,
-        );
+        let create = self.create_menu(path, cx);
         let rename = self.edit_action(
             EditKind::Rename {
                 path: path.to_path_buf(),
@@ -465,22 +518,12 @@ impl SlimNotes {
             cx,
         );
         let delete = self.delete_action(path.to_path_buf(), cx);
-        move |menu, _, _| {
-            let (new_note, new_folder, rename, delete) = (
-                new_note.clone(),
-                new_folder.clone(),
-                rename.clone(),
-                delete.clone(),
-            );
-            menu.item(
-                PopupMenuItem::new("New note").on_click(move |e, w, cx| new_note(e, w, cx)),
-            )
-            .item(
-                PopupMenuItem::new("New folder").on_click(move |e, w, cx| new_folder(e, w, cx)),
-            )
-            .separator()
-            .item(PopupMenuItem::new("Rename").on_click(move |e, w, cx| rename(e, w, cx)))
-            .item(PopupMenuItem::new("Delete").on_click(move |e, w, cx| delete(e, w, cx)))
+        move |menu, window, cx| {
+            let (rename, delete) = (rename.clone(), delete.clone());
+            create(menu, window, cx)
+                .separator()
+                .item(PopupMenuItem::new("Rename").on_click(move |e, w, cx| rename(e, w, cx)))
+                .item(PopupMenuItem::new("Delete").on_click(move |e, w, cx| delete(e, w, cx)))
         }
     }
 
