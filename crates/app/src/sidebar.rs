@@ -9,7 +9,7 @@ use std::rc::Rc;
 use std::time::Duration;
 
 use gpui::{
-    div, point, px, AnyElement, App, AppContext, ClickEvent, Context, DragMoveEvent, Entity,
+    div, point, px, AnyElement, App, AppContext, ClickEvent, Context, Div, DragMoveEvent, Entity,
     Focusable, InteractiveElement, IntoElement, ParentElement, Pixels, SharedString,
     StatefulInteractiveElement, Styled, Subscription, Window,
 };
@@ -260,7 +260,7 @@ impl SlimNotes {
         let fg = cx.theme().sidebar_foreground;
 
         let mut out = Vec::new();
-        let pad_left = px(6.0 + depth as f32 * 12.0);
+        let pad_left = px(row_indent(depth));
 
         for entry in entries {
             // A rename turns the entry's own row into a text field; a folder
@@ -288,9 +288,9 @@ impl SlimNotes {
                         // shrinkable by default — which would squeeze a long
                         // tree to fit instead of letting it scroll.
                         .flex_shrink_0()
+                        .relative()
                         .items_center()
                         .gap_1()
-                        .overflow_hidden()
                         .pl(pad_left)
                         .pr_2()
                         .py(px(3.))
@@ -317,6 +317,7 @@ impl SlimNotes {
                                 cx.new(|_| dragged)
                             },
                         )
+                        .children(indent_guides(depth, cx))
                         .child(
                             div()
                                 .w(px(12.))
@@ -347,8 +348,8 @@ impl SlimNotes {
                 let mut row = h_flex()
                     .id(SharedString::from(format!("file-{id}")))
                     .flex_shrink_0()
+                    .relative()
                     .items_center()
-                    .overflow_hidden()
                     .pl(pad_left)
                     .pr_2()
                     .py(px(3.))
@@ -367,6 +368,7 @@ impl SlimNotes {
                             cx.new(|_| dragged)
                         },
                     )
+                    .children(indent_guides(depth, cx))
                     .child(self.render_name(&id, label))
                     .on_click(cx.listener({
                         let path = path.clone();
@@ -403,6 +405,7 @@ impl SlimNotes {
         };
         h_flex()
             .flex_shrink_0()
+            .relative()
             .items_center()
             .pl(px(2.0 + depth as f32 * 12.0))
             .pr_2()
@@ -413,6 +416,7 @@ impl SlimNotes {
             .on_action(cx.listener(|this, _: &gpui_component::input::Escape, _, cx| {
                 this.cancel_edit(cx);
             }))
+            .children(indent_guides(depth, cx))
             .child(
                 Input::new(&edit.input)
                     .xsmall()
@@ -1021,6 +1025,44 @@ fn drag_scroll_step(y: Pixels, height: Pixels) -> Pixels {
     };
     let t = (over.abs() / edge).min(1.);
     px(over.signum() * (DRAG_SCROLL_MIN + (DRAG_SCROLL_MAX - DRAG_SCROLL_MIN) * t))
+}
+
+/// Left padding of a tree row at `depth`: where a folder's chevron, or a note's
+/// name, starts.
+fn row_indent(depth: usize) -> f32 {
+    6.0 + depth as f32 * 12.0
+}
+
+/// How far into a folder's chevron box its indent guide runs: under the tip of
+/// the glyph, which is 5px wide and sits at the left of the box rather than
+/// centered in it.
+const GUIDE_OFFSET: f32 = 2.0;
+
+/// Indent guides for a row at `depth`: a thin vertical line under the chevron
+/// of each folder the row is inside. Every row of an expanded folder draws
+/// them, so they join up into one line from the folder down to its last
+/// descendant, which is what makes the nesting of a deep tree readable.
+///
+/// Each line reaches 1px above its row, across the tree's `gap_px`, or the line
+/// would be dashed. That is why the rows do not clip their children: any
+/// overflow other than visible clips *both* axes in gpui, and a row's name
+/// ellipsizes itself.
+///
+/// Translucent rather than a solid theme color, so the line still shows over a
+/// hovered or selected row instead of breaking there.
+fn indent_guides(depth: usize, cx: &App) -> Vec<Div> {
+    let color = cx.theme().muted_foreground.alpha(0.3);
+    (0..depth)
+        .map(|level| {
+            div()
+                .absolute()
+                .top(px(-1.))
+                .bottom_0()
+                .left(px(row_indent(level) + GUIDE_OFFSET))
+                .w_px()
+                .bg(color)
+        })
+        .collect()
 }
 
 /// An entry being dragged through the tree. Renders as the label that follows
