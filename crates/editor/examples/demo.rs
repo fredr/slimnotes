@@ -58,6 +58,11 @@ fn sample() -> String {
          | Tables | done | right-aligned |\n\
          | Wikilinks | done | centered status |\n\
          \n\
+         | Topic | Detail | Owner |\n\
+         | --- | --- | --- |\n\
+         | Wrapping | A cell whose text is far too long to sit on one row, so the column has to give way and the text has to wrap inside the cell instead of running off the right edge of the window | someone with a rather long name |\n\
+         | Short | ok | me |\n\
+         \n\
          Back to normal prose after the block.",
     )
 }

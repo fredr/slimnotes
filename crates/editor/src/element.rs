@@ -62,12 +62,11 @@ fn runs_digest(runs: &[TextRun]) -> u64 {
     h.finish()
 }
 
-/// The editor's persistent shaping caches: soft-wrapped body lines, and the
-/// unwrapped single lines used for table cells.
+/// The editor's persistent shaping cache: soft-wrapped lines, keyed by text,
+/// size, wrap width and run styling — body lines and table cells alike.
 #[derive(Default)]
 pub(crate) struct ShapeCaches {
     wrapped: HashMap<ShapeKey, WrappedLine>,
-    lines: HashMap<ShapeKey, gpui::ShapedLine>,
 }
 
 /// Serves shaped lines for one build, from cache where possible.
@@ -135,31 +134,6 @@ impl Shaper {
         shaped
     }
 
-    /// An unwrapped single line (a table cell). Width is not a shaping input
-    /// here, so it stays 0 in the key; the map is separate from `wrapped` anyway.
-    fn line(
-        &mut self,
-        window: &mut Window,
-        display: &SharedString,
-        font_size: Pixels,
-        runs: &[TextRun],
-    ) -> gpui::ShapedLine {
-        let key = Self::key(display, font_size, px(0.), runs);
-        if let Some(hit) = self
-            .prev
-            .as_mut()
-            .and_then(|p| p.lines.remove(&key))
-            .or_else(|| self.cur.lines.get(&key).cloned())
-        {
-            self.cur.lines.insert(key, hit.clone());
-            return hit;
-        }
-        let shaped = window
-            .text_system()
-            .shape_line(display.clone(), font_size, runs, None);
-        self.cur.lines.insert(key, shaped.clone());
-        shaped
-    }
 }
 
 /// Proves, without shaping, that a line fits on a single row.
@@ -486,10 +460,14 @@ impl EditorElement {
             let aligns = table_aligns(ctx.lines[start + 1]);
             let row_lis: Vec<usize> = (start..=end).filter(|&li| li != start + 1).collect();
             let mut rows: Vec<Vec<TableCell>> = Vec::new();
+            // Shaping inputs kept per cell so a cell that has to be narrowed can
+            // be re-shaped below without rebuilding its runs.
+            let mut inputs: Vec<Vec<(SharedString, Vec<TextRun>)>> = Vec::new();
             let mut colw: Vec<Pixels> = Vec::new();
             for (ri, &li) in row_lis.iter().enumerate() {
                 let weight = if ri == 0 { FontWeight::BOLD } else { FontWeight::NORMAL };
                 let mut cells = Vec::new();
+                let mut row_inputs = Vec::new();
                 for (c, span) in table_cell_spans(ctx.lines[li]).into_iter().enumerate() {
                     let cds = ctx.line_off[li] + span.start;
                     let cde = ctx.line_off[li] + span.end;
@@ -511,12 +489,22 @@ impl EditorElement {
                         ctx.cursor,
                         ctx.selection,
                     );
-                    let sl =
-                        shaper.line(window, &SharedString::from(display), px(TABLE_FONT), &runs);
+                    // Pass 1 shapes against the full content width. That both
+                    // measures the cell's natural (unwrapped) width — which is
+                    // what the columns are sized from — and is already the final
+                    // shape for every cell whose column ends up wide enough.
+                    let display = SharedString::from(display);
+                    let sl = shaper.wrapped(
+                        window,
+                        &display,
+                        px(TABLE_FONT),
+                        &runs,
+                        ctx.wrap_width,
+                    );
                     if c >= colw.len() {
                         colw.resize(c + 1, px(0.));
                     }
-                    colw[c] = colw[c].max(sl.width);
+                    colw[c] = colw[c].max(sl.unwrapped_layout.width);
                     cells.push(TableCell {
                         shaped: sl,
                         segs,
@@ -526,12 +514,18 @@ impl EditorElement {
                         width: px(0.),
                         align: aligns.get(c).copied().unwrap_or(TableAlign::Left),
                     });
+                    row_inputs.push((display, runs));
                 }
                 rows.push(cells);
+                inputs.push(row_inputs);
             }
             for w in &mut colw {
                 *w += px(TABLE_PAD_X * 2.);
             }
+            // Squeeze the columns into the window if the natural widths overflow
+            // it; the cells that no longer fit their column are re-shaped so
+            // their text wraps inside the cell instead of running off-screen.
+            let colw = fit_columns(&colw, ctx.wrap_width);
             let mut colx: Vec<Pixels> = vec![px(0.)];
             for w in &colw {
                 colx.push(*colx.last().unwrap() + *w);
@@ -546,6 +540,12 @@ impl EditorElement {
                 for (c, cell) in cells.iter_mut().enumerate() {
                     cell.x = colx[c];
                     cell.width = colw[c];
+                    let text_w = (cell.width - px(TABLE_PAD_X * 2.)).max(px(1.));
+                    if cell.shaped.unwrapped_layout.width > text_w {
+                        let (display, runs) = &inputs[ri][c];
+                        cell.shaped =
+                            shaper.wrapped(window, display, px(TABLE_FONT), runs, text_w);
+                    }
                 }
                 out.insert(li, TableRender::Row(cells));
                 ri += 1;
@@ -576,10 +576,16 @@ impl EditorElement {
             let lh = px(TABLE_FONT * 1.5);
             let (segs, height) = match &tr {
                 TableRender::Sep => (Vec::new(), px(0.)),
-                TableRender::Row(_) => (
-                    vec![Seg { src: 0..line.len(), disp: 0..0, sub: true }],
-                    lh + px(TABLE_PAD_Y * 2.),
-                ),
+                // As tall as the tallest cell: a cell too wide for its column
+                // wraps, and every cell in the row grows to match so the grid
+                // stays a grid.
+                TableRender::Row(cells) => {
+                    let rows = cells.iter().map(|c| c.rows()).max().unwrap_or(1);
+                    (
+                        vec![Seg { src: 0..line.len(), disp: 0..0, sub: true }],
+                        lh * rows as f32 + px(TABLE_PAD_Y * 2.),
+                    )
+                }
             };
             // A table row paints its cells, never this line's own text, and its
             // height is fixed by the font — so it never needs shaping.
@@ -1287,10 +1293,7 @@ impl Element for EditorElement {
                     let a = src_to_disp(&line.segs, ss.max(ls) - ls);
                     let b = src_to_disp(&line.segs, se.min(le) - ls);
                     let lh = line.line_height;
-                    let pa = wrapped.position_for_index(a, lh).unwrap_or_default();
-                    let pb = wrapped.position_for_index(b, lh).unwrap_or_default();
-                    let full_w = wrapped.size(lh).width;
-                    let paint_row = |win: &mut Window, x0: Pixels, x1: Pixels, row_y: Pixels| {
+                    for (x0, x1, row_y) in row_bands(wrapped, a, b, lh) {
                         let shift = line.x_offset(row_y);
                         let rect = Bounds {
                             origin: point(content.origin.x + x0 + shift, screen_top + row_y),
@@ -1300,17 +1303,6 @@ impl Element for EditorElement {
                             Some(ring) => band_quad(rect, bg, ring),
                             None => fill(rect, bg),
                         });
-                    };
-                    if pa.y == pb.y {
-                        paint_row(win, pa.x, pb.x, pa.y);
-                    } else {
-                        paint_row(win, pa.x, full_w, pa.y);
-                        let mut ry = pa.y + lh;
-                        while ry + px(0.5) < pb.y {
-                            paint_row(win, px(0.), full_w, ry);
-                            ry += lh;
-                        }
-                        paint_row(win, px(0.), pb.x, pb.y);
                     }
                 }
             };
@@ -1396,10 +1388,33 @@ impl Element for EditorElement {
                         rgb(TABLE_BORDER),
                         BorderStyle::Solid,
                     ));
+                    let lh = line.line_height;
                     let text_origin = point(cx0 + cell.text_x(), screen_top + px(TABLE_PAD_Y));
+                    // A band over a cell-local display range, one quad per
+                    // wrapped row it covers — the cell's counterpart to the
+                    // line-level `paint_band` above.
+                    let cell_band = |win: &mut Window, a: usize, b: usize, bg, ring| {
+                        for (x0, x1, y) in row_bands(&cell.shaped, a, b, lh) {
+                            let rect = Bounds {
+                                origin: point(text_origin.x + x0, screen_top + px(1.) + y),
+                                size: size((x1 - x0).max(px(3.)), lh),
+                            };
+                            win.paint_quad(match ring {
+                                Some(ring) => band_quad(rect, bg, ring),
+                                None => fill(rect, bg),
+                            });
+                        }
+                    };
                     // paint_background draws inline code/highlight run backgrounds
-                    // (ShapedLine::paint only draws glyphs).
-                    let _ = cell.shaped.paint_background(text_origin, line.line_height, window, cx);
+                    // (WrappedLine::paint only draws glyphs).
+                    let _ = cell.shaped.paint_background(
+                        text_origin,
+                        lh,
+                        TextAlign::Left,
+                        None,
+                        window,
+                        cx,
+                    );
                     // A table row has no `wrapped` line of its own — every cell
                     // is separately shaped — so the `paint_highlights` above
                     // cannot draw the find's matches or the selection over it;
@@ -1410,27 +1425,28 @@ impl Element for EditorElement {
                         for (ix, m) in search_in(matches, cell.src_start, cell.src_end) {
                             let covered =
                                 cell_selection(cell.src_start, cell.src_end, Some((m.start, m.end)));
-                            let (x0, x1) = match covered {
-                                Some(CellSel::Whole) => (cx0 + px(1.), cx0 + cell.width - px(1.)),
+                            let (bg, ring) = match_colors(ix == *current);
+                            match covered {
+                                Some(CellSel::Whole) => {
+                                    let rect = Bounds {
+                                        origin: point(cx0 + px(1.), screen_top + px(1.)),
+                                        size: size(
+                                            (cell.width - px(2.)).max(px(0.)),
+                                            (line.height - px(2.)).max(px(0.)),
+                                        ),
+                                    };
+                                    window.paint_quad(match ring {
+                                        Some(ring) => band_quad(rect, bg, ring),
+                                        None => fill(rect, bg),
+                                    });
+                                }
                                 Some(CellSel::Part(r)) => {
-                                    let a = cell.shaped.x_for_index(src_to_disp(&cell.segs, r.start));
-                                    let b = cell.shaped.x_for_index(src_to_disp(&cell.segs, r.end));
-                                    (text_origin.x + a, text_origin.x + b)
+                                    let a = src_to_disp(&cell.segs, r.start);
+                                    let b = src_to_disp(&cell.segs, r.end);
+                                    cell_band(window, a, b, bg, ring);
                                 }
                                 None => continue,
-                            };
-                            let rect = Bounds {
-                                origin: point(x0, screen_top + px(1.)),
-                                size: size(
-                                    (x1 - x0).max(px(3.)),
-                                    (line.height - px(2.)).max(px(0.)),
-                                ),
-                            };
-                            let (bg, ring) = match_colors(ix == *current);
-                            window.paint_quad(match ring {
-                                Some(ring) => band_quad(rect, bg, ring),
-                                None => fill(rect, bg),
-                            });
+                            }
                         }
                     }
                     match cell_selection(cell.src_start, cell.src_end, prepaint.selection) {
@@ -1450,17 +1466,13 @@ impl Element for EditorElement {
                         Some(CellSel::Part(r)) => {
                             let a = src_to_disp(&cell.segs, r.start);
                             let b = src_to_disp(&cell.segs, r.end);
-                            let x0 = cell.shaped.x_for_index(a);
-                            let x1 = cell.shaped.x_for_index(b);
-                            let rect = Bounds {
-                                origin: point(text_origin.x + x0, screen_top + px(1.)),
-                                size: size((x1 - x0).max(px(3.)), (line.height - px(2.)).max(px(0.))),
-                            };
-                            window.paint_quad(fill(rect, rgb(SELECTION)));
+                            cell_band(window, a, b, rgb(SELECTION).into(), None);
                         }
                         None => {}
                     }
-                    let _ = cell.shaped.paint(text_origin, line.line_height, window, cx);
+                    let _ = cell
+                        .shaped
+                        .paint(text_origin, lh, TextAlign::Left, None, window, cx);
                 }
                 continue;
             }

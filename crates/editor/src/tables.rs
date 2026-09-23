@@ -3,7 +3,7 @@
 
 use std::ops::Range;
 
-use gpui::{px, Font, FontWeight, Pixels, Point, TextRun};
+use gpui::{px, Font, FontWeight, Pixels, Point, TextRun, WrappedLine};
 
 use crate::*;
 
@@ -11,6 +11,10 @@ pub(crate) const TABLE_PAD_X: f32 = 10.0; // horizontal cell padding (px)
 pub(crate) const TABLE_PAD_Y: f32 = 5.0; // vertical cell padding (px)
 pub(crate) const TABLE_FONT: f32 = 16.0; // table cell font size (px)
 pub(crate) const TABLE_BORDER: u32 = 0x3a3a3a; // cell border color
+/// Narrowest a column may be squeezed to when a table is too wide for the
+/// window (content + both pads). Below this, wrapping turns cells into a column
+/// of single letters, which is worse than overflowing.
+pub(crate) const TABLE_MIN_COL: f32 = 60.0;
 
 /// An open table context menu: the window-space point to anchor it at and which
 /// cell (source line + column) it acts on.
@@ -47,7 +51,9 @@ pub(crate) enum TableAlign {
 /// caret / hit-test clicks inside it for in-cell editing.
 #[derive(Clone)]
 pub(crate) struct TableCell {
-    pub(crate) shaped: gpui::ShapedLine,
+    /// Shaped against the cell's own content width, so a long cell wraps onto
+    /// further rows instead of running out past the table (and the window).
+    pub(crate) shaped: WrappedLine,
     pub(crate) segs: Vec<Seg>,   // cell-local source <-> display transform
     pub(crate) src_start: usize, // document offset of the cell's content start
     pub(crate) src_end: usize,   // document offset of the cell's content end
@@ -58,13 +64,22 @@ pub(crate) struct TableCell {
 
 impl TableCell {
     /// Horizontal offset of the shaped text within the cell box (alignment pad).
+    ///
+    /// A wrapped cell fills its box by definition, so all three alignments
+    /// collapse to the left pad there — alignment only shows on cells short
+    /// enough to have slack.
     pub(crate) fn text_x(&self) -> Pixels {
-        let tw = self.shaped.width;
+        let tw = self.shaped.width();
         match self.align {
             TableAlign::Left => px(TABLE_PAD_X),
             TableAlign::Right => (self.width - px(TABLE_PAD_X) - tw).max(px(TABLE_PAD_X)),
             TableAlign::Center => ((self.width - tw) / 2.).max(px(TABLE_PAD_X)),
         }
+    }
+
+    /// How many visual rows the cell's text occupies.
+    pub(crate) fn rows(&self) -> usize {
+        self.shaped.wrap_boundaries().len() + 1
     }
 }
 
@@ -180,6 +195,58 @@ pub(crate) fn table_cell_spans(line: &str) -> Vec<Range<usize>> {
         pos = seg_end + 1; // skip the '|'
     }
     spans
+}
+
+/// Column widths (padding included) that make the table fit `avail`.
+///
+/// While the natural widths fit, they are used as-is — a table only ever
+/// narrows, never stretches, so a small table keeps looking like a small table.
+/// Past that, every column is shrunk in proportion to its natural width, so the
+/// wide columns give up the most, with two floors: a column never goes below
+/// `TABLE_MIN_COL` (a one-letter-per-row column is worse than an overflowing
+/// one) and never below its own natural width (shrinking a column that already
+/// fits buys nothing). Columns pinned at a floor drop out and the rest re-share
+/// what is left, repeating until nothing more is pinned — at most one pass per
+/// column. If even the floors don't fit, the table overflows.
+pub(crate) fn fit_columns(natural: &[Pixels], avail: Pixels) -> Vec<Pixels> {
+    let nat: Vec<f32> = natural.iter().map(|w| f32::from(*w)).collect();
+    let avail = f32::from(avail);
+    if nat.is_empty() || nat.iter().sum::<f32>() <= avail {
+        return natural.to_vec();
+    }
+    // Per-column floor: the global minimum, but never more than the column
+    // actually wants.
+    let floor: Vec<f32> = nat.iter().map(|w| w.min(TABLE_MIN_COL)).collect();
+    let mut out = nat.clone();
+    let mut pinned = vec![false; nat.len()];
+    loop {
+        let taken: f32 = (0..nat.len()).filter(|&i| pinned[i]).map(|i| out[i]).sum();
+        let budget = avail - taken;
+        let flex: Vec<usize> = (0..nat.len()).filter(|&i| !pinned[i]).collect();
+        if flex.is_empty() {
+            break;
+        }
+        let flex_total: f32 = flex.iter().map(|&i| nat[i]).sum();
+        let mut changed = false;
+        for &i in &flex {
+            let share = if flex_total > 0. {
+                budget * nat[i] / flex_total
+            } else {
+                budget / flex.len() as f32
+            };
+            if share < floor[i] {
+                out[i] = floor[i];
+                pinned[i] = true;
+                changed = true;
+            } else {
+                out[i] = share;
+            }
+        }
+        if !changed {
+            break;
+        }
+    }
+    out.into_iter().map(px).collect()
 }
 
 /// Per-column alignment from the separator row (`:--` left, `--:` right, `:-:`).

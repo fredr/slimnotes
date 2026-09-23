@@ -116,19 +116,7 @@ impl VisualLine {
     ///
     /// `None` for an unshaped line, which has no glyph positions.
     pub(crate) fn caret_pos(&self, disp: usize) -> Option<Point<Pixels>> {
-        let wrapped = self.wrapped.as_ref()?;
-        // The display index each continuation row starts at, in row order.
-        let row_start = |b: &gpui::WrapBoundary| {
-            Some(wrapped.runs().get(b.run_ix)?.glyphs.get(b.glyph_ix)?.index)
-        };
-        match wrapped
-            .wrap_boundaries()
-            .iter()
-            .position(|b| row_start(b) == Some(disp))
-        {
-            Some(i) => Some(point(px(0.), self.line_height * (i + 1) as f32)),
-            None => wrapped.position_for_index(disp, self.line_height),
-        }
+        wrapped_caret_pos(self.wrapped.as_ref()?, disp, self.line_height)
     }
 
     /// Total x-offset for a point at local y: the whole-line inset plus, for
@@ -141,6 +129,56 @@ impl VisualLine {
         };
         self.left_inset + hang
     }
+}
+
+/// Where the caret belongs for display byte `disp` in a wrapped line, resolving
+/// soft-wrap boundaries to the *start* of the following row — see
+/// [`VisualLine::caret_pos`], which is this over the line's own shape. Table
+/// cells are wrapped lines of their own, so they need it too.
+pub(crate) fn wrapped_caret_pos(
+    w: &WrappedLine,
+    disp: usize,
+    line_height: Pixels,
+) -> Option<Point<Pixels>> {
+    // The display index each continuation row starts at, in row order.
+    let row_start =
+        |b: &gpui::WrapBoundary| Some(w.runs().get(b.run_ix)?.glyphs.get(b.glyph_ix)?.index);
+    match w
+        .wrap_boundaries()
+        .iter()
+        .position(|b| row_start(b) == Some(disp))
+    {
+        Some(i) => Some(point(px(0.), line_height * (i + 1) as f32)),
+        None => w.position_for_index(disp, line_height),
+    }
+}
+
+/// The horizontal bands covering display range `a..b` of a wrapped line: one
+/// `(x0, x1, row top y)` per visual row it spans, in line-local coordinates.
+/// Shared by everything that draws over a range — the selection, the find's
+/// matches, link hitboxes — so they all break across soft wraps the same way.
+pub(crate) fn row_bands(
+    w: &WrappedLine,
+    a: usize,
+    b: usize,
+    line_height: Pixels,
+) -> Vec<(Pixels, Pixels, Pixels)> {
+    let pa = w.position_for_index(a, line_height).unwrap_or_default();
+    let pb = w.position_for_index(b, line_height).unwrap_or_default();
+    let full_w = w.size(line_height).width;
+    let mut out = Vec::new();
+    if pa.y == pb.y {
+        out.push((pa.x, pb.x, pa.y));
+        return out;
+    }
+    out.push((pa.x, full_w, pa.y));
+    let mut y = pa.y + line_height;
+    while y + px(0.5) < pb.y {
+        out.push((px(0.), full_w, y));
+        y += line_height;
+    }
+    out.push((px(0.), pb.x, pb.y));
+    out
 }
 
 #[derive(Clone)]
@@ -218,29 +256,15 @@ impl Layout {
             let lh = l.line_height;
             let a = src_to_disp(&l.segs, src.start - l.start);
             let b = src_to_disp(&l.segs, src.end.min(line_end) - l.start);
-            let Some(pa) = wrapped.position_for_index(a, lh) else { continue };
-            let pb = wrapped.position_for_index(b, lh).unwrap_or(pa);
-            let full_w = wrapped.size(lh).width;
-            let mut row = |x0: Pixels, x1: Pixels, y: Pixels| {
+            // A link normally sits on one row; a long one can wrap, so cover
+            // each row it spans.
+            for (x0, x1, y) in row_bands(wrapped, a, b, lh) {
                 if x1 > x0 {
                     out.push(Bounds {
                         origin: point(x0 + l.x_offset(y), l.top + y),
                         size: size(x1 - x0, lh),
                     });
                 }
-            };
-            // A link normally sits on one row; a long one can wrap, so cover
-            // each row it spans.
-            if pa.y == pb.y {
-                row(pa.x, pb.x, pa.y);
-            } else {
-                row(pa.x, full_w, pa.y);
-                let mut y = pa.y + lh;
-                while y + px(0.5) < pb.y {
-                    row(px(0.), full_w, y);
-                    y += lh;
-                }
-                row(px(0.), pb.x, pb.y);
             }
         }
         out
@@ -290,8 +314,20 @@ impl Layout {
         // Table row: hit-test within the clicked cell and map to its source.
         if let Some(TableRender::Row(cells)) = &l.table {
             if let Some(cell) = pick_cell(cells, x) {
-                let text_x = (x - cell.x - cell.text_x()).max(px(0.));
-                let disp = cell.shaped.closest_index_for_x(text_x);
+                let lh = l.line_height;
+                // A cell's text is only as tall as its own wrapped rows, while the
+                // row box is as tall as the tallest cell in it — clamp into the
+                // last row so a click in a short cell's empty space lands at the
+                // end of its text rather than back at its start.
+                let last_row = lh * (cell.rows() - 1) as f32;
+                let local = point(
+                    (x - cell.x - cell.text_x()).max(px(0.)),
+                    (content_y - l.top - px(TABLE_PAD_Y)).clamp(px(0.), last_row),
+                );
+                let disp = cell
+                    .shaped
+                    .closest_index_for_position(local, lh)
+                    .unwrap_or_else(|e| e);
                 return cell.src_start + disp_to_src(&cell.segs, disp);
             }
             return l.start;
@@ -324,10 +360,12 @@ impl Layout {
             {
                 let off = cursor.clamp(cell.src_start, cell.src_end);
                 let disp = src_to_disp(&cell.segs, off - cell.src_start);
-                let cx = cell.x + cell.text_x() + cell.shaped.x_for_index(disp);
-                return Some((cx, l.top + px(TABLE_PAD_Y), px(TABLE_FONT * 1.5)));
+                let lh = l.line_height;
+                let p = wrapped_caret_pos(&cell.shaped, disp, lh).unwrap_or_default();
+                let cx = cell.x + cell.text_x() + p.x;
+                return Some((cx, l.top + px(TABLE_PAD_Y) + p.y, lh));
             }
-            return Some((px(0.), l.top + px(TABLE_PAD_Y), px(TABLE_FONT * 1.5)));
+            return Some((px(0.), l.top + px(TABLE_PAD_Y), l.line_height));
         }
         // A table separator (`| --- |`) renders nothing and is zero-height, so it
         // has no caret position. Reporting one would put a zero-height caret on an

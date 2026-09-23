@@ -1711,6 +1711,59 @@ mod tests {
     }
 
     #[test]
+    fn table_columns_keep_their_natural_width_while_they_fit() {
+        let nat = [px(100.), px(200.), px(60.)];
+        assert_eq!(fit_columns(&nat, px(400.)), nat);
+        // Exactly full is still a fit — no need to wrap anything.
+        assert_eq!(fit_columns(&nat, px(360.)), nat);
+        assert_eq!(fit_columns(&[], px(400.)), Vec::<Pixels>::new());
+    }
+
+    #[test]
+    fn table_columns_shrink_proportionally_to_fit() {
+        // 1200px of columns into 600px: each keeps its share of the total, so
+        // the table fits exactly and the widest column gives up the most. All
+        // three stay clear of the floor, so nothing is pinned.
+        let out = fit_columns(&[px(200.), px(400.), px(600.)], px(600.));
+        let total: f32 = out.iter().map(|w| f32::from(*w)).sum();
+        assert!((total - 600.).abs() < 0.5, "{out:?}");
+        assert!((f32::from(out[0]) - 100.).abs() < 0.5, "{out:?}");
+        assert!((f32::from(out[1]) - 200.).abs() < 0.5, "{out:?}");
+        assert!((f32::from(out[2]) - 300.).abs() < 0.5, "{out:?}");
+
+        // When a share lands under the floor that column is pinned there and the
+        // rest re-share what is left — still an exact fit.
+        let out = fit_columns(&[px(100.), px(200.), px(300.)], px(300.));
+        let total: f32 = out.iter().map(|w| f32::from(*w)).sum();
+        assert!((total - 300.).abs() < 0.5, "{out:?}");
+        assert_eq!(out[0], px(TABLE_MIN_COL));
+        assert!((f32::from(out[1]) - 96.).abs() < 0.5, "{out:?}");
+        assert!((f32::from(out[2]) - 144.).abs() < 0.5, "{out:?}");
+    }
+
+    #[test]
+    fn a_narrow_table_column_is_not_squeezed_past_the_floor() {
+        // The tiny column's proportional share would be ~10px, which would wrap
+        // it to one letter per row. It is pinned at the floor instead, and the
+        // wide column absorbs the difference — the table still fits.
+        let out = fit_columns(&[px(40.), px(960.)], px(500.));
+        let total: f32 = out.iter().map(|w| f32::from(*w)).sum();
+        assert!((total - 500.).abs() < 0.5, "{out:?}");
+        // 40 < TABLE_MIN_COL, so its own natural width is the floor: a column
+        // that already fits is never shrunk.
+        assert_eq!(out[0], px(40.));
+        assert!((f32::from(out[1]) - 460.).abs() < 0.5, "{out:?}");
+    }
+
+    #[test]
+    fn a_table_too_narrow_for_its_floors_overflows_rather_than_vanishing() {
+        // Six wide columns can't fit 100px even at the minimum; every column
+        // lands on the floor and the table simply overflows.
+        let out = fit_columns(&[px(500.); 6], px(100.));
+        assert!(out.iter().all(|w| *w == px(TABLE_MIN_COL)), "{out:?}");
+    }
+
+    #[test]
     fn table_cell_selection_covers_the_whole_cell_or_part_of_it() {
         // A cell holding document bytes 10..20.
         let sel = |a: usize, b: usize| cell_selection(10, 20, Some((a, b)));
