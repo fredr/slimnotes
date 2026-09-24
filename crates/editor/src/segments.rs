@@ -173,9 +173,9 @@ pub(crate) fn dim_ranges(
     ranges
 }
 
-/// The display transforms for a line. Block-level markup (heading `#`, bullet)
-/// reveals when the caret is anywhere on the line; a checkbox reveals only when
-/// the caret is next to it. Inline markers (`**`/`*`/`` ` ``/link brackets)
+/// The display transforms for a line. A heading's `#` reveals when the caret is
+/// anywhere on the line; a bullet or checkbox reveals only when the caret is
+/// next to it (within its `- ` / `- [ ] ` prefix). Inline markers (`**`/`*`/`` ` ``/link brackets)
 /// reveal per-span: each shows raw only when the caret or selection touches its
 /// own element (see [`marker_revealed`]) — otherwise it stays concealed even
 /// while other parts of the same line are being edited.
@@ -200,10 +200,12 @@ pub(crate) fn line_ops(
         if shown {
             ops.push(Op { src: range, repl: Repl::Checkbox(checked) });
         }
-    } else if !on_line {
-        // Plain bullet: swap the marker char for a dot.
-        if let Some(info) = parse_list_line(line) {
-            ops.push(Op { src: info.marker.clone(), repl: Repl::Bullet });
+    } else if let Some(info) = parse_list_line(line) {
+        // Plain bullet: swap the marker char for a dot. Like a checkbox, the raw
+        // marker shows only while the caret is next to it, not merely on the line.
+        let near = cursor_col.is_some_and(|c| c >= info.marker.start && c < info.content);
+        if !near {
+            ops.push(Op { src: info.marker, repl: Repl::Bullet });
         }
     }
 

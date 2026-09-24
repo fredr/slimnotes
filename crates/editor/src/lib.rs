@@ -2036,6 +2036,29 @@ mod tests {
     }
 
     #[test]
+    fn bullet_reveals_only_next_to_marker() {
+        // Line starts at doc offset 10 so the caret is a document offset.
+        let bullet = |line: &str, cursor: usize| {
+            line_ops(line, 10, &[], &[], cursor, None)
+                .iter()
+                .any(|o| matches!(o.repl, Repl::Bullet))
+        };
+        let line = "  - buy milk";
+        // marker `-`=2, content starts at col 4.
+        // Caret on another line, or in the text -> dot shown.
+        assert!(bullet(line, 0));
+        assert!(bullet(line, 10 + 8));
+        // Caret next to the marker (within `- `) -> raw shown.
+        assert!(!bullet(line, 10 + 2));
+        assert!(!bullet(line, 10 + 3));
+        // In the indent before the marker, or at the first text column -> dot stays.
+        assert!(bullet(line, 10 + 1));
+        assert!(bullet(line, 10 + 4));
+        // An empty item with the caret at its end still shows the dot.
+        assert!(bullet("- ", 10 + 2));
+    }
+
+    #[test]
     fn embeds_go_on_their_own_line() {
         let n = |s: &str| vec![s.to_string()];
         // Caret after text: broken onto a fresh line first.
