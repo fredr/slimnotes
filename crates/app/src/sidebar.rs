@@ -9,9 +9,9 @@ use std::rc::Rc;
 use std::time::Duration;
 
 use gpui::{
-    div, point, px, AnyElement, App, AppContext, ClickEvent, Context, Div, DragMoveEvent, Entity,
-    Focusable, InteractiveElement, IntoElement, ParentElement, Pixels, SharedString,
-    StatefulInteractiveElement, Styled, Subscription, Window,
+    div, point, px, AnyElement, App, AppContext, ClickEvent, ClipboardItem, Context, Div,
+    DragMoveEvent, Entity, Focusable, InteractiveElement, IntoElement, ParentElement, Pixels,
+    SharedString, StatefulInteractiveElement, Styled, Subscription, Window,
 };
 use gpui_component::{
     button::{Button, ButtonVariants},
@@ -498,7 +498,7 @@ impl SlimNotes {
         }
     }
 
-    /// Rename / Delete, plus creation inside the folder.
+    /// Copy path / Rename / Delete, plus creation inside the folder.
     fn folder_menu(
         &self,
         path: &Path,
@@ -518,9 +518,12 @@ impl SlimNotes {
             cx,
         );
         let delete = self.delete_action(path.to_path_buf(), cx);
+        let copy_path = copy_path_action(path);
         move |menu, window, cx| {
-            let (rename, delete) = (rename.clone(), delete.clone());
+            let (copy_path, rename, delete) = (copy_path.clone(), rename.clone(), delete.clone());
             create(menu, window, cx)
+                .separator()
+                .item(PopupMenuItem::new("Copy path").on_click(move |e, w, cx| copy_path(e, w, cx)))
                 .separator()
                 .item(PopupMenuItem::new("Rename").on_click(move |e, w, cx| rename(e, w, cx)))
                 .item(PopupMenuItem::new("Delete").on_click(move |e, w, cx| delete(e, w, cx)))
@@ -545,9 +548,12 @@ impl SlimNotes {
             cx,
         );
         let delete = self.delete_action(path.to_path_buf(), cx);
+        let copy_path = copy_path_action(path);
         move |menu, _, _| {
-            let (rename, delete) = (rename.clone(), delete.clone());
-            menu.item(PopupMenuItem::new("Rename").on_click(move |e, w, cx| rename(e, w, cx)))
+            let (copy_path, rename, delete) = (copy_path.clone(), rename.clone(), delete.clone());
+            menu.item(PopupMenuItem::new("Copy path").on_click(move |e, w, cx| copy_path(e, w, cx)))
+                .separator()
+                .item(PopupMenuItem::new("Rename").on_click(move |e, w, cx| rename(e, w, cx)))
                 .item(PopupMenuItem::new("Delete").on_click(move |e, w, cx| delete(e, w, cx)))
         }
     }
@@ -1106,6 +1112,14 @@ fn indent_guides(depth: usize, cx: &App) -> Vec<Div> {
                 .bg(color)
         })
         .collect()
+}
+
+/// Put `path` on the clipboard as text. The tree's paths are absolute, since
+/// the vault is picked with the system folder dialog, so this is the OS path to
+/// paste into a terminal or another app.
+fn copy_path_action(path: &Path) -> MenuAction {
+    let path = path.to_string_lossy().into_owned();
+    Rc::new(move |_, _, cx| cx.write_to_clipboard(ClipboardItem::new_string(path.clone())))
 }
 
 /// An entry being dragged through the tree. Renders as the label that follows
