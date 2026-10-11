@@ -4,7 +4,7 @@ use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
-use gpui::{ImageFormat, RenderImage};
+use gpui::{px, size, ImageFormat, Pixels, RenderImage, Size};
 
 /// An image referenced on its own line: a markdown path or an Obsidian embed.
 #[derive(Debug, PartialEq)]
@@ -84,6 +84,34 @@ fn dimension(s: &str) -> Option<f32> {
         return None;
     }
     s.parse::<f32>().ok().filter(|n| *n > 0.)
+}
+
+/// How big to draw an image. An embed's own `|size` is taken as written — that
+/// is the point of asking — and otherwise the picture is shown at its natural
+/// size. Either way it is then fitted to `max_w` (see [`fit_width`]).
+///
+/// There is deliberately no height cap. One used to be applied here, and
+/// because a screenshot is taller than it is wide relative to the page, it was
+/// what decided the size of virtually every image, shrinking each one to a
+/// fraction of the available width. A tall image is simply tall; the page
+/// scrolls.
+pub(crate) fn fit_image(data: &RenderImage, want: Option<ImageSize>, max_w: Pixels) -> Size<Pixels> {
+    let iw = (data.size(0).width.0 as f32).max(1.0);
+    let ih = (data.size(0).height.0 as f32).max(1.0);
+    let (w, h) = match want {
+        // `|width` alone keeps the aspect ratio; `|width x height` is taken
+        // literally, stretch and all.
+        Some(s) => (s.width, s.height.unwrap_or(ih * s.width / iw)),
+        None => (iw, ih),
+    };
+    fit_width(size(px(w), px(h)), max_w)
+}
+
+/// `sz` scaled down, keeping its aspect ratio, until it is no wider than
+/// `max_w`. Never scales up.
+pub(crate) fn fit_width(sz: Size<Pixels>, max_w: Pixels) -> Size<Pixels> {
+    let scale = (f32::from(max_w) / f32::from(sz.width).max(1.0)).min(1.0);
+    size(sz.width * scale, sz.height * scale)
 }
 
 /// The image file types the editor can decode and draw. Doubles as the filter

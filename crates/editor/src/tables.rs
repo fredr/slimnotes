@@ -2,8 +2,11 @@
 //! cell context menu.
 
 use std::ops::Range;
+use std::sync::Arc;
 
-use gpui::{px, Font, FontWeight, Pixels, Point, TextRun, WrappedLine};
+use gpui::{
+    point, px, Font, FontWeight, Pixels, Point, RenderImage, SharedString, Size, TextRun, WrappedLine,
+};
 
 use crate::*;
 
@@ -46,41 +49,218 @@ pub(crate) enum TableAlign {
     Right,
 }
 
+/// One display line of a table cell. A GFM row can't hold a real newline, so a
+/// cell breaks its text at each `<br>` instead (see [`cell_breaks`]), and each
+/// line between them is shaped — and soft-wrapped — on its own.
+#[derive(Clone)]
+pub(crate) struct CellLine {
+    pub(crate) disp: usize, // cell display offset of the line's first byte
+    pub(crate) shaped: WrappedLine,
+}
+
 /// A rendered table cell: its shaped text plus column geometry (x/width are
 /// relative to the table's left edge) and the source mapping needed to place the
 /// caret / hit-test clicks inside it for in-cell editing.
+///
+/// Positions inside a cell (`caret_pos`, `disp_at`, `bands`, `line_origin`)
+/// are relative to the cell box's left edge and the top of its text, i.e. just
+/// below the top pad.
 #[derive(Clone)]
 pub(crate) struct TableCell {
-    /// Shaped against the cell's own content width, so a long cell wraps onto
-    /// further rows instead of running out past the table (and the window).
-    pub(crate) shaped: WrappedLine,
+    /// The cell's display lines, never empty. Each is shaped against the cell's
+    /// own content width, so a long one wraps onto further rows instead of
+    /// running out past the table (and the window).
+    pub(crate) lines: Vec<CellLine>,
     pub(crate) segs: Vec<Seg>,   // cell-local source <-> display transform
     pub(crate) src_start: usize, // document offset of the cell's content start
     pub(crate) src_end: usize,   // document offset of the cell's content end
     pub(crate) x: Pixels,
     pub(crate) width: Pixels,
     pub(crate) align: TableAlign,
+    /// A cell holding only an image draws the picture (at this size) in place
+    /// of its text, which is then empty. See [`cell_image`].
+    pub(crate) image: Option<(Arc<RenderImage>, Size<Pixels>)>,
+}
+
+/// How many visual rows a shaped line occupies.
+fn line_rows(w: &WrappedLine) -> usize {
+    w.wrap_boundaries().len() + 1
 }
 
 impl TableCell {
-    /// Horizontal offset of the shaped text within the cell box (alignment pad).
+    /// Horizontal offset within the cell box of content `w` wide: the
+    /// alignment pad.
     ///
-    /// A wrapped cell fills its box by definition, so all three alignments
-    /// collapse to the left pad there — alignment only shows on cells short
+    /// A wrapped line fills its box by definition, so all three alignments
+    /// collapse to the left pad there — alignment only shows on lines short
     /// enough to have slack.
-    pub(crate) fn text_x(&self) -> Pixels {
-        let tw = self.shaped.width();
+    fn align_x(&self, w: Pixels) -> Pixels {
         match self.align {
             TableAlign::Left => px(TABLE_PAD_X),
-            TableAlign::Right => (self.width - px(TABLE_PAD_X) - tw).max(px(TABLE_PAD_X)),
-            TableAlign::Center => ((self.width - tw) / 2.).max(px(TABLE_PAD_X)),
+            TableAlign::Right => (self.width - px(TABLE_PAD_X) - w).max(px(TABLE_PAD_X)),
+            TableAlign::Center => ((self.width - w) / 2.).max(px(TABLE_PAD_X)),
         }
+    }
+
+    /// Horizontal offset of the cell's image within the cell box.
+    pub(crate) fn image_x(&self) -> Pixels {
+        self.align_x(self.image.as_ref().map_or(px(0.), |(_, sz)| sz.width))
+    }
+
+    /// Where display line `i` starts. Each line is aligned on its own, as the
+    /// lines of an HTML table cell are.
+    pub(crate) fn line_origin(&self, i: usize, line_height: Pixels) -> Point<Pixels> {
+        let above: usize = self.lines[..i].iter().map(|l| line_rows(&l.shaped)).sum();
+        point(self.align_x(self.lines[i].shaped.width()), line_height * above as f32)
     }
 
     /// How many visual rows the cell's text occupies.
     pub(crate) fn rows(&self) -> usize {
-        self.shaped.wrap_boundaries().len() + 1
+        self.lines.iter().map(|l| line_rows(&l.shaped)).sum()
     }
+
+    /// Height of the cell's content, padding excluded.
+    pub(crate) fn content_height(&self, line_height: Pixels) -> Pixels {
+        match &self.image {
+            Some((_, sz)) => sz.height,
+            None => line_height * self.rows() as f32,
+        }
+    }
+
+    /// The widest display line, unwrapped — what the cell asks of its column.
+    pub(crate) fn natural_width(&self) -> Pixels {
+        self.lines
+            .iter()
+            .map(|l| l.shaped.unwrapped_layout.width)
+            .fold(px(0.), Pixels::max)
+    }
+
+    /// Index of the display line holding display offset `disp`.
+    fn line_of(&self, disp: usize) -> usize {
+        self.lines.iter().rposition(|l| l.disp <= disp).unwrap_or(0)
+    }
+
+    /// Caret position for display offset `disp`.
+    pub(crate) fn caret_pos(&self, disp: usize, line_height: Pixels) -> Point<Pixels> {
+        let i = self.line_of(disp);
+        let l = &self.lines[i];
+        let p = wrapped_caret_pos(&l.shaped, disp - l.disp, line_height).unwrap_or_default();
+        self.line_origin(i, line_height) + p
+    }
+
+    /// The display offset nearest `local`. Clamped into the cell's text: a
+    /// click in the empty space under a short cell lands at the end of its last
+    /// line, one beside a short line at that line's end.
+    pub(crate) fn disp_at(&self, local: Point<Pixels>, line_height: Pixels) -> usize {
+        let mut top = px(0.);
+        for (i, l) in self.lines.iter().enumerate() {
+            let h = line_height * line_rows(&l.shaped) as f32;
+            if local.y < top + h || i + 1 == self.lines.len() {
+                let o = self.line_origin(i, line_height);
+                let at = point(
+                    (local.x - o.x).max(px(0.)),
+                    (local.y - top).clamp(px(0.), h - line_height),
+                );
+                let d = l
+                    .shaped
+                    .closest_index_for_position(at, line_height)
+                    .unwrap_or_else(|e| e);
+                return l.disp + d;
+            }
+            top += h;
+        }
+        0
+    }
+
+    /// The bands covering display range `a..b`: one `(x0, x1, y)` per visual
+    /// row it touches, across the cell's lines — the cell's counterpart to
+    /// [`row_bands`].
+    pub(crate) fn bands(&self, a: usize, b: usize, line_height: Pixels) -> Vec<(Pixels, Pixels, Pixels)> {
+        let mut out = Vec::new();
+        for (i, l) in self.lines.iter().enumerate() {
+            let (la, lb) = (a.max(l.disp), b.min(l.disp + l.shaped.len()));
+            if la > lb {
+                continue;
+            }
+            let o = self.line_origin(i, line_height);
+            for (x0, x1, y) in row_bands(&l.shaped, la - l.disp, lb - l.disp, line_height) {
+                out.push((o.x + x0, o.x + x1, o.y + y));
+            }
+        }
+        out
+    }
+}
+
+/// Split a cell's display string, and its runs, into its lines: at the
+/// newlines its `<br>`s were displayed as (see [`Repl::Break`]), which are
+/// themselves dropped. One `(display offset, text, runs)` per line.
+pub(crate) fn split_cell_lines(
+    display: &str,
+    runs: &[TextRun],
+) -> Vec<(usize, SharedString, Vec<TextRun>)> {
+    let ends = display.match_indices('\n').map(|(i, _)| i).chain([display.len()]);
+    let mut start = 0;
+    let mut out = Vec::new();
+    for end in ends {
+        let mut line_runs = Vec::new();
+        let mut pos = 0;
+        for run in runs {
+            let (a, b) = (pos.max(start), (pos + run.len).min(end));
+            if a < b {
+                line_runs.push(TextRun { len: b - a, ..run.clone() });
+            }
+            pos += run.len;
+        }
+        out.push((start, SharedString::from(display[start..end].to_string()), line_runs));
+        start = end + 1;
+    }
+    out
+}
+
+/// Document ranges of the `<br>` tags in a table row line: the line breaks of
+/// its cells. `<br/>` and `<br />` count too, in any case. One inside a code
+/// span, or escaped (`\<br>`), is literal text.
+pub(crate) fn cell_breaks(line: &str, line_start: usize, spans: &[Span]) -> Vec<Range<usize>> {
+    let mut out = Vec::new();
+    let mut i = 0;
+    while let Some(rel) = line[i..].find('<') {
+        let s = i + rel;
+        i = s + 1;
+        let Some(len) = br_tag_len(&line[s..]) else { continue };
+        let doc = line_start + s;
+        let in_code = spans
+            .iter()
+            .any(|sp| sp.attr == Attr::Code && sp.start <= doc && doc < sp.end);
+        if in_code || escaped(line, s) {
+            continue;
+        }
+        out.push(doc..doc + len);
+        i = s + len;
+    }
+    out
+}
+
+/// Length of the `<br>` / `<br/>` / `<br />` tag at the start of `s`, if any.
+fn br_tag_len(s: &str) -> Option<usize> {
+    let b = s.as_bytes();
+    if b.len() < 4 || b[0] != b'<' || !b[1..3].eq_ignore_ascii_case(b"br") {
+        return None;
+    }
+    let mut j = 3;
+    while b.get(j) == Some(&b' ') {
+        j += 1;
+    }
+    if b.get(j) == Some(&b'/') {
+        j += 1;
+    }
+    (b.get(j) == Some(&b'>')).then_some(j + 1)
+}
+
+/// The image a table cell holds, if the cell is solely one. Inside a table the
+/// `|` before a size has to be escaped (`![[img.png\|300]]`), since a bare one
+/// would end the cell, so it is unescaped before the usual image-line parse.
+pub(crate) fn cell_image(cell: &str) -> Option<ImageEmbed> {
+    parse_image_line(&cell.replace("\\|", "|"))
 }
 
 /// What a selection covers of one table cell.
@@ -176,23 +356,31 @@ pub(crate) fn split_table_row(line: &str) -> Vec<String> {
 /// Line-local byte ranges of each cell's *trimmed content* (mirrors
 /// [`split_table_row`] but keeps source positions, so a rendered cell can map
 /// clicks/caret back to the raw markdown for in-cell editing).
+///
+/// As in GFM, a `|` right after a backslash is cell content, not a column
+/// break — that is how a pipe gets into a cell, e.g. `![[img.png\|300]]`.
 pub(crate) fn table_cell_spans(line: &str) -> Vec<Range<usize>> {
+    let b = line.as_bytes();
+    let is_sep = |i: usize| b[i] == b'|' && (i == 0 || b[i - 1] != b'\\');
     let mut start = line.len() - line.trim_start().len();
     let mut end = line.trim_end().len();
-    if line[start..end].starts_with('|') {
+    if start < end && is_sep(start) {
         start += 1;
     }
-    if end > start && line[start..end].ends_with('|') {
+    if end > start && is_sep(end - 1) {
         end -= 1;
     }
     let mut spans = Vec::new();
     let mut pos = start;
-    for part in line[start..end].split('|') {
-        let seg_end = pos + part.len();
+    for i in start..=end {
+        if i < end && !is_sep(i) {
+            continue;
+        }
+        let part = &line[pos..i];
         let cs = pos + (part.len() - part.trim_start().len());
-        let ce = seg_end - (part.len() - part.trim_end().len());
+        let ce = i - (part.len() - part.trim_end().len());
         spans.push(cs..ce.max(cs));
-        pos = seg_end + 1; // skip the '|'
+        pos = i + 1; // skip the '|'
     }
     spans
 }
@@ -247,6 +435,39 @@ pub(crate) fn fit_columns(natural: &[Pixels], avail: Pixels) -> Vec<Pixels> {
         }
     }
     out.into_iter().map(px).collect()
+}
+
+/// Column widths (padding included) for a table whose cells may hold images.
+///
+/// `text[c]` is the natural width of column `c`'s text and `image[c]` that of
+/// its widest image (zero if it has none). A narrowed image is still a whole
+/// picture, while narrowed text wraps — so images give way first: the text is
+/// fitted as by [`fit_columns`] (an image column holding on to at least
+/// `TABLE_MIN_COL` of picture), and only the room left after that goes to the
+/// images, shared in proportion to how much more each column wants.
+pub(crate) fn table_columns(text: &[Pixels], image: &[Pixels], avail: Pixels) -> Vec<Pixels> {
+    let want: Vec<f32> = text.iter().zip(image).map(|(&t, &i)| f32::from(t.max(i))).collect();
+    if want.iter().sum::<f32>() <= f32::from(avail) {
+        return want.into_iter().map(px).collect();
+    }
+    let need: Vec<Pixels> = text
+        .iter()
+        .zip(image)
+        .map(|(&t, &i)| t.max(i.min(px(TABLE_MIN_COL))))
+        .collect();
+    let base: Vec<f32> = fit_columns(&need, avail).into_iter().map(f32::from).collect();
+    let spare = f32::from(avail) - base.iter().sum::<f32>();
+    let excess: Vec<f32> = want.iter().zip(&base).map(|(w, b)| (w - b).max(0.)).collect();
+    let total: f32 = excess.iter().sum();
+    if spare <= 0. || total <= 0. {
+        return base.into_iter().map(px).collect();
+    }
+    // `total > spare` (else everything would have fit), so no column is given
+    // more than it wants.
+    base.iter()
+        .zip(&excess)
+        .map(|(b, e)| px(b + spare * e / total))
+        .collect()
 }
 
 /// Per-column alignment from the separator row (`:--` left, `--:` right, `:-:`).
@@ -413,19 +634,34 @@ pub(crate) fn cell_spans<'a>(
 /// reveal per-span exactly as on a normal line. `cell_doc_start` is the document
 /// offset of the cell's content; `spans`/`markers` are in document coordinates
 /// (see [`cell_spans`]), so `cursor`/`selection` line up with them directly.
+///
+/// `breaks` are the row's `<br>`s (see [`cell_breaks`]); those in this cell
+/// become line breaks. Unlike a marker, a break stays a break with the caret
+/// beside it — that is where the caret sits after Enter — and shows raw only
+/// with the caret inside the tag itself.
 pub(crate) fn build_cell(
     cell: &str,
     cell_doc_start: usize,
     spans: &[Span],
     markers: &[(usize, usize)],
+    breaks: &[Range<usize>],
     base_font: &Font,
     weight: FontWeight,
     cursor: usize,
     sel: Option<(usize, usize)>,
 ) -> (String, Vec<TextRun>, Vec<Seg>) {
     let cds = cell_doc_start;
-    let ops = line_ops(cell, cds, markers, spans, cursor, sel);
-    let dim = dim_ranges(cell, cds, markers, spans, cursor, sel);
+    let mut ops = line_ops(cell, cds, markers, spans, cursor, sel);
+    let mut dim = dim_ranges(cell, cds, markers, spans, cursor, sel);
+    for r in breaks.iter().filter(|r| r.start >= cds && r.end <= cds + cell.len()) {
+        let local = r.start - cds..r.end - cds;
+        if r.start < cursor && cursor < r.end {
+            dim.push((local.start, local.end)); // being edited: raw, grayed like markup
+        } else if !ops.iter().any(|o| local.start < o.src.end && o.src.start < local.end) {
+            ops.push(Op { src: local, repl: Repl::Break });
+        }
+    }
+    ops.sort_by_key(|o| o.src.start);
     let (display, runs, segs, _checks) =
         build_line(cell, cds, &ops, spans, base_font, &dim, weight, false);
     (display, runs, segs)

@@ -63,6 +63,12 @@ fn sample() -> String {
          | Wrapping | A cell whose text is far too long to sit on one row, so the column has to give way and the text has to wrap inside the cell instead of running off the right edge of the window | someone with a rather long name |\n\
          | Short | ok | me |\n\
          \n\
+         | Image | How | Notes |\n\
+         | --- | :---: | --- |\n\
+         | ![[att.png]] | natural | an embed in a cell,<br>and a `<br>` line break |\n\
+         | ![[pic.png\\|120]] | sized | size pipe escaped |\n\
+         | ![wide](wide.png) | squeezed | too wide, fitted to its column |\n\
+         \n\
          Back to normal prose after the block.",
     )
 }

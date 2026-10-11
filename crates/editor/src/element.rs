@@ -69,6 +69,9 @@ pub(crate) struct ShapeCaches {
     wrapped: HashMap<ShapeKey, WrappedLine>,
 }
 
+/// What one table-cell line is shaped from: its display text and runs.
+type LineInput = (SharedString, Vec<TextRun>);
+
 /// Serves shaped lines for one build, from cache where possible.
 ///
 /// On a full rebuild, hits move out of `prev` into `cur` and whatever is left in
@@ -454,78 +457,120 @@ impl EditorElement {
         blocks: impl Iterator<Item = (usize, usize)>,
         shaper: &mut Shaper,
         window: &mut Window,
+        cx: &mut App,
     ) -> HashMap<usize, TableRender> {
         let mut out: HashMap<usize, TableRender> = HashMap::new();
         for (start, end) in blocks {
             let aligns = table_aligns(ctx.lines[start + 1]);
             let row_lis: Vec<usize> = (start..=end).filter(|&li| li != start + 1).collect();
             let mut rows: Vec<Vec<TableCell>> = Vec::new();
-            // Shaping inputs kept per cell so a cell that has to be narrowed can
-            // be re-shaped below without rebuilding its runs.
-            let mut inputs: Vec<Vec<(SharedString, Vec<TextRun>)>> = Vec::new();
-            let mut colw: Vec<Pixels> = Vec::new();
+            // Shaping inputs kept per cell line so a cell that has to be
+            // narrowed can be re-shaped below without rebuilding its runs.
+            let mut inputs: Vec<Vec<Vec<LineInput>>> = Vec::new();
+            // Natural column widths, text and images apart (see `table_columns`).
+            let mut text_nat: Vec<Pixels> = Vec::new();
+            let mut image_nat: Vec<Pixels> = Vec::new();
             for (ri, &li) in row_lis.iter().enumerate() {
                 let weight = if ri == 0 { FontWeight::BOLD } else { FontWeight::NORMAL };
                 let mut cells = Vec::new();
                 let mut row_inputs = Vec::new();
+                let breaks =
+                    cell_breaks(ctx.lines[li], ctx.line_off[li], &ctx.parsed.line_spans[li]);
                 for (c, span) in table_cell_spans(ctx.lines[li]).into_iter().enumerate() {
                     let cds = ctx.line_off[li] + span.start;
                     let cde = ctx.line_off[li] + span.end;
                     let cell_text = &ctx.lines[li][span.clone()];
-                    // Reuse the memoized document parse for this cell's range
-                    // rather than re-parsing the cell.
-                    let (spans, markers) = cell_spans(
-                        &ctx.parsed.line_spans[li],
-                        &ctx.parsed.line_markers[li],
-                        cds..cde,
-                    );
-                    let (display, runs, segs) = build_cell(
-                        cell_text,
-                        cds,
-                        &spans,
-                        &markers,
-                        &ctx.base_font,
-                        weight,
-                        ctx.cursor,
-                        ctx.selection,
-                    );
+                    // A cell holding only an image shows the picture, unless the
+                    // caret is in it — then its source, for editing, just as an
+                    // image line does.
+                    let caret_in = ctx.cursor >= cds && ctx.cursor <= cde;
+                    let image = (!caret_in)
+                        .then(|| cell_image(cell_text))
+                        .flatten()
+                        .and_then(|embed| {
+                            let data = self.editor.update(cx, |e, _| e.image_for(&embed.target))?;
+                            // Fitted to the page for now; narrowed to its column
+                            // below once the column widths are known.
+                            let sz = fit_image(&data, embed.size, ctx.wrap_width);
+                            Some((data, sz))
+                        });
+                    let (display, runs, segs) = if image.is_some() {
+                        // No text: the whole cell source maps to an empty display.
+                        let segs = vec![Seg { src: 0..cell_text.len(), disp: 0..0, sub: true }];
+                        (String::new(), Vec::new(), segs)
+                    } else {
+                        // Reuse the memoized document parse for this cell's range
+                        // rather than re-parsing the cell.
+                        let (spans, markers) = cell_spans(
+                            &ctx.parsed.line_spans[li],
+                            &ctx.parsed.line_markers[li],
+                            cds..cde,
+                        );
+                        build_cell(
+                            cell_text,
+                            cds,
+                            &spans,
+                            &markers,
+                            &breaks,
+                            &ctx.base_font,
+                            weight,
+                            ctx.cursor,
+                            ctx.selection,
+                        )
+                    };
                     // Pass 1 shapes against the full content width. That both
                     // measures the cell's natural (unwrapped) width — which is
                     // what the columns are sized from — and is already the final
                     // shape for every cell whose column ends up wide enough.
-                    let display = SharedString::from(display);
-                    let sl = shaper.wrapped(
-                        window,
-                        &display,
-                        px(TABLE_FONT),
-                        &runs,
-                        ctx.wrap_width,
-                    );
-                    if c >= colw.len() {
-                        colw.resize(c + 1, px(0.));
-                    }
-                    colw[c] = colw[c].max(sl.unwrapped_layout.width);
-                    cells.push(TableCell {
-                        shaped: sl,
+                    let parts = split_cell_lines(&display, &runs);
+                    let lines = parts
+                        .iter()
+                        .map(|(disp, text, runs)| CellLine {
+                            disp: *disp,
+                            shaped: shaper.wrapped(
+                                window,
+                                text,
+                                px(TABLE_FONT),
+                                runs,
+                                ctx.wrap_width,
+                            ),
+                        })
+                        .collect();
+                    let line_inputs: Vec<LineInput> =
+                        parts.into_iter().map(|(_, text, runs)| (text, runs)).collect();
+                    let mut cell = TableCell {
+                        lines,
                         segs,
                         src_start: cds,
                         src_end: cde,
                         x: px(0.), // filled in once column widths are known
                         width: px(0.),
                         align: aligns.get(c).copied().unwrap_or(TableAlign::Left),
-                    });
-                    row_inputs.push((display, runs));
+                        image: None,
+                    };
+                    if c >= text_nat.len() {
+                        text_nat.resize(c + 1, px(0.));
+                        image_nat.resize(c + 1, px(0.));
+                    }
+                    match &image {
+                        Some((_, sz)) => image_nat[c] = image_nat[c].max(sz.width),
+                        None => text_nat[c] = text_nat[c].max(cell.natural_width()),
+                    }
+                    cell.image = image;
+                    cells.push(cell);
+                    row_inputs.push(line_inputs);
                 }
                 rows.push(cells);
                 inputs.push(row_inputs);
             }
-            for w in &mut colw {
+            for w in text_nat.iter_mut().chain(&mut image_nat) {
                 *w += px(TABLE_PAD_X * 2.);
             }
             // Squeeze the columns into the window if the natural widths overflow
             // it; the cells that no longer fit their column are re-shaped so
-            // their text wraps inside the cell instead of running off-screen.
-            let colw = fit_columns(&colw, ctx.wrap_width);
+            // their text wraps inside the cell instead of running off-screen,
+            // and images are scaled down to their column.
+            let colw = table_columns(&text_nat, &image_nat, ctx.wrap_width);
             let mut colx: Vec<Pixels> = vec![px(0.)];
             for w in &colw {
                 colx.push(*colx.last().unwrap() + *w);
@@ -541,10 +586,14 @@ impl EditorElement {
                     cell.x = colx[c];
                     cell.width = colw[c];
                     let text_w = (cell.width - px(TABLE_PAD_X * 2.)).max(px(1.));
-                    if cell.shaped.unwrapped_layout.width > text_w {
-                        let (display, runs) = &inputs[ri][c];
-                        cell.shaped =
-                            shaper.wrapped(window, display, px(TABLE_FONT), runs, text_w);
+                    if let Some((_, sz)) = &mut cell.image {
+                        *sz = fit_width(*sz, text_w);
+                        continue;
+                    }
+                    for (line, (text, runs)) in cell.lines.iter_mut().zip(&inputs[ri][c]) {
+                        if line.shaped.unwrapped_layout.width > text_w {
+                            line.shaped = shaper.wrapped(window, text, px(TABLE_FONT), runs, text_w);
+                        }
                     }
                 }
                 out.insert(li, TableRender::Row(cells));
@@ -577,18 +626,19 @@ impl EditorElement {
             let (segs, height) = match &tr {
                 TableRender::Sep => (Vec::new(), px(0.)),
                 // As tall as the tallest cell: a cell too wide for its column
-                // wraps, and every cell in the row grows to match so the grid
-                // stays a grid.
+                // wraps (or holds an image), and every cell in the row grows to
+                // match so the grid stays a grid.
                 TableRender::Row(cells) => {
-                    let rows = cells.iter().map(|c| c.rows()).max().unwrap_or(1);
+                    let content =
+                        cells.iter().map(|c| c.content_height(lh)).fold(lh, Pixels::max);
                     (
                         vec![Seg { src: 0..line.len(), disp: 0..0, sub: true }],
-                        lh * rows as f32 + px(TABLE_PAD_Y * 2.),
+                        content + px(TABLE_PAD_Y * 2.),
                     )
                 }
             };
             // A table row paints its cells, never this line's own text, and its
-            // height is fixed by the font — so it never needs shaping.
+            // height is settled by the cells — so it never needs shaping.
             return VisualLine {
                 start: offset,
                 source: line.to_string(),
@@ -767,26 +817,9 @@ impl EditorElement {
             }
         }
 
-        // How big to draw an image. An embed's own `|size` is taken as written
-        // — that is the point of asking — and otherwise the picture is shown at
-        // its natural size. Either way it is then fitted to the page width.
-        //
-        // There is deliberately no height cap. One used to be applied here, and
-        // because a screenshot is taller than it is wide relative to the page,
-        // it was what decided the size of virtually every image, shrinking each
-        // one to a fraction of the available width. A tall image is simply tall;
-        // the page scrolls.
         let image = image.map(|(data, want)| {
-            let iw = (data.size(0).width.0 as f32).max(1.0);
-            let ih = (data.size(0).height.0 as f32).max(1.0);
-            let (w, h) = match want {
-                // `|width` alone keeps the aspect ratio; `|width x height` is
-                // taken literally, stretch and all.
-                Some(s) => (s.width, s.height.unwrap_or(ih * s.width / iw)),
-                None => (iw, ih),
-            };
-            let scale = (f32::from(ctx.wrap_width) / w).min(1.0);
-            (data, size(px(w * scale), px(h * scale)))
+            let sz = fit_image(&data, want, ctx.wrap_width);
+            (data, sz)
         });
         let height = match &image {
             Some((_, sz)) => sz.height + px(IMAGE_PAD * 2.),
@@ -1062,6 +1095,7 @@ impl Element for EditorElement {
                         .filter(|&(s, e)| dirty.iter().any(|&li| (s..=e).contains(&li))),
                     &mut shaper,
                     window,
+                    cx,
                 );
                 for &li in &dirty {
                     let tr = table_map.remove(&li);
@@ -1107,7 +1141,7 @@ impl Element for EditorElement {
         let started = std::time::Instant::now();
         let mut shaper =
             Shaper::rebuilding(self.editor.update(cx, |e, _| std::mem::take(&mut e.shapes)));
-        let mut table_map = self.build_tables(&ctx, tables.iter().copied(), &mut shaper, window);
+        let mut table_map = self.build_tables(&ctx, tables.iter().copied(), &mut shaper, window, cx);
         // Pass 1: build every line and settle its exact height, shaping only the
         // lines that might wrap (a line proven to fit one row defers shaping).
         let mut lines = Vec::with_capacity(lines_vec.len());
@@ -1389,14 +1423,21 @@ impl Element for EditorElement {
                         BorderStyle::Solid,
                     ));
                     let lh = line.line_height;
-                    let text_origin = point(cx0 + cell.text_x(), screen_top + px(TABLE_PAD_Y));
+                    // The cell box's left edge at the top of its text, which
+                    // the cell's own positions are relative to.
+                    let text_origin = point(cx0, screen_top + px(TABLE_PAD_Y));
+                    // An image cell has no text to highlight part of, so any
+                    // selection or match touching it covers the whole cell.
+                    let cover = |c: Option<CellSel>| {
+                        c.map(|c| if cell.image.is_some() { CellSel::Whole } else { c })
+                    };
                     // A band over a cell-local display range, one quad per
                     // wrapped row it covers — the cell's counterpart to the
                     // line-level `paint_band` above.
                     let cell_band = |win: &mut Window, a: usize, b: usize, bg, ring| {
-                        for (x0, x1, y) in row_bands(&cell.shaped, a, b, lh) {
+                        for (x0, x1, y) in cell.bands(a, b, lh) {
                             let rect = Bounds {
-                                origin: point(text_origin.x + x0, screen_top + px(1.) + y),
+                                origin: point(cx0 + x0, screen_top + px(1.) + y),
                                 size: size((x1 - x0).max(px(3.)), lh),
                             };
                             win.paint_quad(match ring {
@@ -1407,14 +1448,16 @@ impl Element for EditorElement {
                     };
                     // paint_background draws inline code/highlight run backgrounds
                     // (WrappedLine::paint only draws glyphs).
-                    let _ = cell.shaped.paint_background(
-                        text_origin,
-                        lh,
-                        TextAlign::Left,
-                        None,
-                        window,
-                        cx,
-                    );
+                    for (i, l) in cell.lines.iter().enumerate() {
+                        let _ = l.shaped.paint_background(
+                            text_origin + cell.line_origin(i, lh),
+                            lh,
+                            TextAlign::Left,
+                            None,
+                            window,
+                            cx,
+                        );
+                    }
                     // A table row has no `wrapped` line of its own — every cell
                     // is separately shaped — so the `paint_highlights` above
                     // cannot draw the find's matches or the selection over it;
@@ -1423,8 +1466,11 @@ impl Element for EditorElement {
                     // still reads as highlighted, and before the glyphs.
                     if let Some((matches, current)) = &prepaint.search {
                         for (ix, m) in search_in(matches, cell.src_start, cell.src_end) {
-                            let covered =
-                                cell_selection(cell.src_start, cell.src_end, Some((m.start, m.end)));
+                            let covered = cover(cell_selection(
+                                cell.src_start,
+                                cell.src_end,
+                                Some((m.start, m.end)),
+                            ));
                             let (bg, ring) = match_colors(ix == *current);
                             match covered {
                                 Some(CellSel::Whole) => {
@@ -1449,7 +1495,7 @@ impl Element for EditorElement {
                             }
                         }
                     }
-                    match cell_selection(cell.src_start, cell.src_end, prepaint.selection) {
+                    match cover(cell_selection(cell.src_start, cell.src_end, prepaint.selection)) {
                         Some(CellSel::Whole) => {
                             // Inset by the border so the grid stays visible
                             // through the band, which is what makes a
@@ -1470,9 +1516,18 @@ impl Element for EditorElement {
                         }
                         None => {}
                     }
-                    let _ = cell
-                        .shaped
-                        .paint(text_origin, lh, TextAlign::Left, None, window, cx);
+                    // Over the selection band, which then shows as a frame in the
+                    // cell padding around the picture rather than hiding it.
+                    if let Some((data, sz)) = &cell.image {
+                        let origin = point(text_origin.x + cell.image_x(), text_origin.y);
+                        let rect = Bounds { origin, size: *sz };
+                        let _ = window.paint_image(rect, Corners::all(px(4.)), data.clone(), 0, false);
+                        continue;
+                    }
+                    for (i, l) in cell.lines.iter().enumerate() {
+                        let origin = text_origin + cell.line_origin(i, lh);
+                        let _ = l.shaped.paint(origin, lh, TextAlign::Left, None, window, cx);
+                    }
                 }
                 continue;
             }

@@ -167,7 +167,7 @@ fn in_code(pos: usize, code_ranges: &[Range<usize>]) -> bool {
 
 /// Whether the marker starting at `pos` is backslash-escaped (an odd run of
 /// preceding backslashes).
-fn escaped(text: &str, pos: usize) -> bool {
+pub(crate) fn escaped(text: &str, pos: usize) -> bool {
     text.as_bytes()[..pos].iter().rev().take_while(|&&b| b == b'\\').count() % 2 == 1
 }
 

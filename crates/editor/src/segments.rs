@@ -30,11 +30,14 @@ pub(crate) struct Seg {
 }
 
 /// One line-local edit to the display: hide the source range, replace it with a
-/// bullet glyph, or reserve a slot for a painted checkbox.
+/// bullet glyph, reserve a slot for a painted checkbox, or break the line.
 pub(crate) enum Repl {
     Hide,
     Bullet,
     Checkbox(bool), // checked?
+    /// A table cell's `<br>`: a `\n` in the display, where the cell starts a
+    /// new line (see `split_cell_lines`).
+    Break,
 }
 
 pub(crate) struct Op {
@@ -249,6 +252,11 @@ pub(crate) fn build_line(
             let dstart = dpos;
             match &op.repl {
                 Repl::Hide => {}
+                Repl::Break => {
+                    display.push('\n');
+                    runs.push(copy_run(StyleKey::default(), 1, base_font, base_weight, checked, false));
+                    dpos += 1;
+                }
                 Repl::Bullet => {
                     display.push_str(BULLET);
                     runs.push(bullet_run(BULLET.len(), base_font));

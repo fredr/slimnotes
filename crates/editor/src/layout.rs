@@ -314,20 +314,11 @@ impl Layout {
         // Table row: hit-test within the clicked cell and map to its source.
         if let Some(TableRender::Row(cells)) = &l.table {
             if let Some(cell) = pick_cell(cells, x) {
-                let lh = l.line_height;
-                // A cell's text is only as tall as its own wrapped rows, while the
-                // row box is as tall as the tallest cell in it — clamp into the
-                // last row so a click in a short cell's empty space lands at the
-                // end of its text rather than back at its start.
-                let last_row = lh * (cell.rows() - 1) as f32;
-                let local = point(
-                    (x - cell.x - cell.text_x()).max(px(0.)),
-                    (content_y - l.top - px(TABLE_PAD_Y)).clamp(px(0.), last_row),
-                );
-                let disp = cell
-                    .shaped
-                    .closest_index_for_position(local, lh)
-                    .unwrap_or_else(|e| e);
+                // `disp_at` clamps into the cell's own text: the row box is as
+                // tall as the tallest cell in it, so a click in a short cell's
+                // empty space lands at the end of its text.
+                let local = point(x - cell.x, content_y - l.top - px(TABLE_PAD_Y));
+                let disp = cell.disp_at(local, l.line_height);
                 return cell.src_start + disp_to_src(&cell.segs, disp);
             }
             return l.start;
@@ -361,9 +352,8 @@ impl Layout {
                 let off = cursor.clamp(cell.src_start, cell.src_end);
                 let disp = src_to_disp(&cell.segs, off - cell.src_start);
                 let lh = l.line_height;
-                let p = wrapped_caret_pos(&cell.shaped, disp, lh).unwrap_or_default();
-                let cx = cell.x + cell.text_x() + p.x;
-                return Some((cx, l.top + px(TABLE_PAD_Y) + p.y, lh));
+                let p = cell.caret_pos(disp, lh);
+                return Some((cell.x + p.x, l.top + px(TABLE_PAD_Y) + p.y, lh));
             }
             return Some((px(0.), l.top + px(TABLE_PAD_Y), l.line_height));
         }
@@ -400,6 +390,21 @@ impl Layout {
                 cells.len() - 1
             });
         Some((l.start, col))
+    }
+}
+
+impl Layout {
+    /// A content-space y just past the edge of the table row holding `cursor`
+    /// — below it (`down`) or above it — or `None` when the caret isn't in a
+    /// table row, or there is nothing above it.
+    pub(crate) fn table_row_exit(&self, cursor: usize, down: bool) -> Option<Pixels> {
+        let l = self.lines.get(self.line_index_at_offset(cursor)?)?;
+        l.table.as_ref()?;
+        if down {
+            Some(l.top + l.height + px(1.))
+        } else {
+            (l.top > px(0.)).then(|| l.top - px(1.))
+        }
     }
 }
 

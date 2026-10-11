@@ -529,16 +529,24 @@ impl MarkdownEditor {
     /// next line, task boxes unchecked and ordered numbers advanced, with the
     /// items below renumbered to make room — and on an item left empty it
     /// removes the marker instead, so a list can be ended with the same key
-    /// that extends it. Anywhere else it is a plain newline.
+    /// that extends it. In a table cell it breaks the line inside the cell.
+    /// Anywhere else it is a plain newline.
     fn insert_newline(&mut self) {
+        let line = offset_to_line_col(&self.text, self.cursor).0;
+        let in_code = self.ensure_parsed().code[line].in_block;
+        // A table row can't hold a newline — one would split the row, and the
+        // table with it — so a cell gets the `<br>` that a cell renders as one.
+        let range = self.selection().unwrap_or(self.cursor..self.cursor);
+        if !in_code && self.in_table_cell(range.clone()) {
+            self.edit(range, "<br>", None);
+            return;
+        }
         // Replacing a selection is an ordinary edit: the caret's line is about
         // to be cut in half, so there is no item to carry forward.
         if self.selection().is_some() {
             self.insert("\n");
             return;
         }
-        let line = offset_to_line_col(&self.text, self.cursor).0;
-        let in_code = self.ensure_parsed().code[line].in_block;
         let (range, insert) = newline_edit(&self.text, self.cursor, in_code);
         self.edit(range, &insert, None);
     }
@@ -593,6 +601,11 @@ impl MarkdownEditor {
             return;
         }
         if self.cursor == 0 {
+            return;
+        }
+        // A cell's `<br>` reads as a line break, so it goes in one keypress.
+        if let Some(br) = self.cell_break(self.cursor, false) {
+            self.edit(br, "", None);
             return;
         }
         let prev = self.buffer.prev_boundary(self.cursor);
@@ -737,6 +750,28 @@ impl MarkdownEditor {
         None
     }
 
+    /// Whether `range` lies within a single table cell's content.
+    fn in_table_cell(&self, range: Range<usize>) -> bool {
+        let (line, _) = offset_to_line_col(&self.text, range.start);
+        let Some((ls, _, spans)) = self.table_row_cells(line) else {
+            return false;
+        };
+        spans
+            .iter()
+            .any(|r| range.start >= ls + r.start && range.end <= ls + r.end)
+    }
+
+    /// The `<br>` in a table cell that starts at `offset` (`after`) or ends at
+    /// it (`!after`), if there is one.
+    fn cell_break(&mut self, offset: usize, after: bool) -> Option<Range<usize>> {
+        let (line, _) = offset_to_line_col(&self.text, offset);
+        let (ls, _, _) = self.table_row_cells(line)?;
+        let parsed = self.ensure_parsed();
+        cell_breaks(line_str(&self.text, line), ls, &parsed.line_spans[line])
+            .into_iter()
+            .find(|r| if after { r.start == offset } else { r.end == offset })
+    }
+
     /// Snap an offset that landed in a table row's pipe/padding gap onto a cell
     /// content boundary — forward to the next cell (or line end), backward to the
     /// previous cell (or line start). Keeps the caret inside editable cells. A
@@ -773,7 +808,16 @@ impl MarkdownEditor {
             if let Some((x, y, lh)) = layout.caret(self.cursor) {
                 let goal = self.goal_x.unwrap_or(x);
                 let target_y = if down { y + lh + px(1.) } else { (y - px(1.)).max(px(0.)) };
-                let new = layout.offset_at(goal, target_y);
+                let mut new = layout.offset_at(goal, target_y);
+                // A table row is as tall as its tallest cell, so one row of
+                // travel can stay inside the row's box while leaving the
+                // caret's own cell, and hit-test straight back to the caret.
+                // Step out past the row's edge instead.
+                if new == self.cursor {
+                    if let Some(y) = layout.table_row_exit(self.cursor, down) {
+                        new = layout.offset_at(goal, y);
+                    }
+                }
                 self.set_cursor(new, shift); // clears goal_x…
                 self.goal_x = Some(goal); // …which we immediately re-sticky
                 return;
@@ -931,8 +975,14 @@ impl MarkdownEditor {
         self.goal_x = Some(goal);
     }
 
-    /// Move left/right one character (table-gap aware), extending on shift.
+    /// Move left/right one character (table-gap aware), extending on shift. A
+    /// cell's `<br>` is crossed in one step, like the line break it shows as.
     fn move_horizontal(&mut self, right: bool, shift: bool) {
+        if let Some(br) = self.cell_break(self.cursor, right) {
+            let p = if right { br.end } else { br.start };
+            self.set_cursor(p, shift);
+            return;
+        }
         if right {
             if let Some(ch) = self.text[self.cursor..].chars().next() {
                 let p = self.snap_table_h(self.cursor + ch.len_utf8(), true);
@@ -982,6 +1032,10 @@ impl MarkdownEditor {
             return;
         }
         if self.cursor >= self.text.len() {
+            return;
+        }
+        if let Some(br) = self.cell_break(self.cursor, true) {
+            self.edit(br, "", None);
             return;
         }
         let next = self.buffer.next_boundary(self.cursor);
@@ -1660,7 +1714,7 @@ mod tests {
         let (spans, markers, _l) = parse(cell);
         let (spans, markers) = cell_spans(&spans, &markers, 0..cell.len());
         let (display, runs, _segs) =
-            build_cell(cell, 0, &spans, &markers, &test_font(), weight, cursor, None);
+            build_cell(cell, 0, &spans, &markers, &[], &test_font(), weight, cursor, None);
         (display, runs)
     }
 
@@ -1717,6 +1771,108 @@ mod tests {
         assert_eq!(spans.len(), 2);
         assert_eq!(&line[spans[0].clone()], "`a`");
         assert_eq!(&line[spans[1].clone()], "bb");
+    }
+
+    #[test]
+    fn table_escaped_pipe_stays_in_its_cell() {
+        let line = r"| ![[cat.png\|200]] | a \| b | c |";
+        let cells = split_table_row(line);
+        assert_eq!(cells, [r"![[cat.png\|200]]", r"a \| b", "c"]);
+        // A trailing escaped pipe is content, not the row's closing pipe.
+        assert_eq!(split_table_row(r"| a | b \|"), ["a", r"b \|"]);
+        // Structural edits keep the escaped pipe and so the column count.
+        let t = "| img | x |\n| --- | --- |\n| ![[cat.png\\|200]] | 1 |";
+        let (out, _, _) = edit_table(t, 2, 1, TableOp::RowBelow).unwrap();
+        assert_eq!(out, "| img | x |\n| --- | --- |\n| ![[cat.png\\|200]] | 1 |\n|  |  |");
+    }
+
+    #[test]
+    fn cell_image_parses_escaped_size() {
+        let embed = cell_image(r"![[cat.png\|200]]").unwrap();
+        assert_eq!(embed.target, ImageRef::Embed("cat.png".into()));
+        assert_eq!(embed.size, Some(ImageSize { width: 200., height: None }));
+        let md = cell_image(r"![cat\|120x80](pics/cat.png)").unwrap();
+        assert_eq!(md.target, ImageRef::Rel("pics/cat.png".into()));
+        assert_eq!(md.size, Some(ImageSize { width: 120., height: Some(80.) }));
+        assert_eq!(cell_image("![[cat.png]]").unwrap().size, None);
+        // Only a cell that is solely an image renders as one.
+        assert!(cell_image("see ![[cat.png]]").is_none());
+        assert!(cell_image("plain text").is_none());
+    }
+
+    #[test]
+    fn table_images_give_way_before_text_wraps() {
+        let none = px(TABLE_PAD_X * 2.);
+        // Everything fits: each column gets the wider of its text and image.
+        let out = table_columns(&[px(50.), px(100.)], &[px(300.), none], px(600.));
+        assert_eq!(out, [px(300.), px(100.)]);
+        // A huge image next to text: the text keeps its natural width and the
+        // image column takes exactly what is left.
+        let out = table_columns(&[none, px(120.), px(200.)], &[px(1600.), none, none], px(800.));
+        assert_eq!(out[1], px(120.));
+        assert_eq!(out[2], px(200.));
+        assert!((f32::from(out[0]) - 480.).abs() < 0.5, "{out:?}");
+        // Two images share the spare room by how much more each wants.
+        let out = table_columns(&[none, none], &[px(1000.), px(500.)], px(600.));
+        let total: f32 = out.iter().map(|w| f32::from(*w)).sum();
+        assert!((total - 600.).abs() < 0.5, "{out:?}");
+        assert!(out[0] > out[1], "{out:?}");
+        // Text that alone overflows still squeezes, but leaves the image a floor.
+        let out = table_columns(&[none, px(2000.)], &[px(800.), none], px(600.));
+        assert!(out[0] >= px(TABLE_MIN_COL), "{out:?}");
+    }
+
+    #[test]
+    fn cell_breaks_find_br_tags_outside_code() {
+        let line = "| a<br>b<BR/>c<br />d | `x<br>y` | \\<br> | <bra> |";
+        let (spans, _, _) = parse(line);
+        let got: Vec<&str> = cell_breaks(line, 0, &spans)
+            .into_iter()
+            .map(|r| &line[r])
+            .collect();
+        // Inline code, an escaped tag and a different tag are left alone.
+        assert_eq!(got, ["<br>", "<BR/>", "<br />"]);
+        // Ranges are in document coordinates.
+        let doc = cell_breaks("|a<br>b|", 10, &[]);
+        assert_eq!(doc.iter().map(|r| (r.start, r.end)).collect::<Vec<_>>(), [(12, 16)]);
+    }
+
+    #[test]
+    fn cell_br_displays_as_a_line_break() {
+        let font = test_font();
+        let cell = "foo<br>bar";
+        let breaks = cell_breaks(cell, 0, &[]);
+        let build = |cursor| build_cell(cell, 0, &[], &[], &breaks, &font, FontWeight::NORMAL, cursor, None);
+        let (display, runs, segs) = build(0);
+        assert_eq!(display, "foo\nbar");
+        // Beside the tag — where Enter leaves the caret — it stays a break: its
+        // start is the end of the first line, its end the start of the second.
+        assert_eq!(build(7).0, "foo\nbar");
+        assert_eq!(src_to_disp(&segs, 3), 3);
+        assert_eq!(src_to_disp(&segs, 7), 4);
+        assert_eq!(disp_to_src(&segs, 3), 3);
+        assert_eq!(disp_to_src(&segs, 4), 7);
+        // With the caret inside the tag it shows raw.
+        assert_eq!(build(5).0, cell);
+        // One run per line, the newline itself dropped.
+        let lines = split_cell_lines(&display, &runs);
+        let texts: Vec<(usize, &str)> = lines.iter().map(|(d, t, _)| (*d, t.as_ref())).collect();
+        assert_eq!(texts, [(0, "foo"), (4, "bar")]);
+        for (_, text, runs) in &lines {
+            assert_eq!(runs.iter().map(|r| r.len).sum::<usize>(), text.len());
+        }
+        // Breaks at the edges and back to back give empty lines.
+        let display = "\n\nx";
+        let texts: Vec<String> =
+            split_cell_lines(display, &[]).into_iter().map(|(_, t, _)| t.to_string()).collect();
+        assert_eq!(texts, ["", "", "x"]);
+    }
+
+    #[test]
+    fn image_fit_width_only_shrinks() {
+        let sz = size(px(400.), px(200.));
+        assert_eq!(fit_width(sz, px(800.)), sz);
+        assert_eq!(fit_width(sz, px(100.)), size(px(100.), px(50.)));
     }
 
     #[test]
