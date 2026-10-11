@@ -71,7 +71,11 @@ rendered view.
   nested underneath: hover the gutter beside an item for a grip that drags it
   up or down its list, and press tab / shift-tab to make it a child of the item
   above or promote it back out. Enter on an empty nested item climbs out one
-  level per press, ending the list at the margin.
+  level per press, ending the list at the margin. Adding or removing items in
+  a numbered list — Enter, backspace, delete, cut, paste — renumbers the items
+  below, as long as the list counted up one at a time (a list numbered `1.`
+  throughout keeps its numbers). Opening a blank line between two items —
+  Enter twice — splits the list, and the part below starts again from 1.
 - `[[wikilinks]]` / `[[target|alias]]` (click to open, resolved via the vault
   index) and clickable `[text](url)` links; inline images (`![](path)` and
   Obsidian `![[embed]]`). An image is drawn at its own size and shrunk to fit

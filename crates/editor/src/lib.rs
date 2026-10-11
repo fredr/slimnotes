@@ -33,6 +33,7 @@ mod images;
 mod input;
 mod layout;
 mod parse;
+mod renumber;
 mod reorder;
 mod scrollbar;
 mod search;
@@ -46,6 +47,7 @@ pub(crate) use images::*;
 pub(crate) use input::*;
 pub(crate) use layout::*;
 pub(crate) use parse::*;
+pub(crate) use renumber::*;
 pub(crate) use reorder::*;
 pub(crate) use scrollbar::*;
 pub(crate) use search::*;
@@ -498,8 +500,14 @@ impl MarkdownEditor {
 
     /// Apply one edit through the buffer (records undo, bumps version), then
     /// refresh the text cache. The caret moves to just past the inserted text.
+    ///
+    /// An edit that adds or removes a numbered list item also renumbers the
+    /// items below it, in the same buffer edit so one undo takes both back.
     fn edit(&mut self, range: Range<usize>, text: &str, coalesce: Option<u8>) {
-        self.cursor = self.buffer.replace(range, text, self.cursor, coalesce);
+        let (range, new, caret) = renumber_edit(&self.text, range, text);
+        // Renumbering is never part of a typing run.
+        let coalesce = coalesce.filter(|_| new.len() == text.len());
+        self.cursor = self.buffer.replace_caret(range, &new, caret, self.cursor, coalesce);
         self.anchor = None;
         self.goal_x = None;
         self.sync_text();
@@ -518,9 +526,10 @@ impl MarkdownEditor {
     }
 
     /// Enter. On a list item this continues the list — a fresh marker on the
-    /// next line, task boxes unchecked and ordered numbers advanced — and on an
-    /// item left empty it removes the marker instead, so a list can be ended
-    /// with the same key that extends it. Anywhere else it is a plain newline.
+    /// next line, task boxes unchecked and ordered numbers advanced, with the
+    /// items below renumbered to make room — and on an item left empty it
+    /// removes the marker instead, so a list can be ended with the same key
+    /// that extends it. Anywhere else it is a plain newline.
     fn insert_newline(&mut self) {
         // Replacing a selection is an ordinary edit: the caret's line is about
         // to be cut in half, so there is no item to carry forward.
@@ -1885,9 +1894,10 @@ mod tests {
         let cursor = before.find('|').expect("the caret must be marked with |");
         let text = before.replacen('|', "", 1);
         let (range, insert) = newline_edit(&text, cursor, in_code);
+        // ...renumbered, as `MarkdownEditor::edit` does with every edit.
+        let (range, insert, caret) = renumber_edit(&text, range, &insert);
         let mut out = text;
-        // The caret lands past the inserted text, as `Buffer::replace` reports.
-        let caret = range.start + insert.len();
+        let caret = range.start + caret;
         out.replace_range(range, &insert);
         out.insert(caret, '|');
         out
@@ -1926,6 +1936,60 @@ mod tests {
         // Numbering is not restarted from a number we can't parse.
         let huge = "1".repeat(40);
         assert_eq!(enter(&format!("{huge}. x|")), format!("{huge}. x\n{huge}. |"));
+    }
+
+    #[test]
+    fn enter_renumbers_the_items_below() {
+        assert_eq!(enter("1. hej\n2. hopp|\n3. hejhej"), "1. hej\n2. hopp\n3. |\n4. hejhej");
+        // However far the list runs, and across a change in digit count.
+        assert_eq!(enter("8. h|\n9. i\n10. j"), "8. h\n9. |\n10. i\n11. j");
+        // Splitting an item: the tail takes the new number.
+        assert_eq!(enter("1. a\n2. ho|pp\n3. c"), "1. a\n2. ho\n3. |pp\n4. c");
+        assert_eq!(enter("1) a|\n2) b"), "1) a\n2) |\n3) b");
+        assert_eq!(enter("1. [x] a|\n2. [ ] b"), "1. [x] a\n2. [ ] |\n3. [ ] b");
+        // A loose list's blank lines and a sibling's children are stepped over.
+        assert_eq!(enter("1. a|\n\n2. b"), "1. a\n2. |\n\n3. b");
+        assert_eq!(enter("1. a|\n2. b\n   - x\n3. c"), "1. a\n2. |\n3. b\n   - x\n4. c");
+    }
+
+    #[test]
+    fn renumbering_stops_where_the_list_does() {
+        // A sub-list counts on its own: neither it nor its parent's list
+        // renumbers the other.
+        assert_eq!(
+            enter("1. a\n   1. x|\n   2. y\n2. b"),
+            "1. a\n   1. x\n   2. |\n   3. y\n2. b"
+        );
+        assert_eq!(enter("1. a|\n   1. x\n2. b"), "1. a\n2. |\n   1. x\n3. b");
+        // A change of delimiter starts a new list, and prose or a bullet at the
+        // list's indent ends it.
+        assert_eq!(enter("1. a|\n2) b"), "1. a\n2. |\n2) b");
+        assert_eq!(enter("1. a|\n\ntext\n2. b"), "1. a\n2. |\n\ntext\n2. b");
+        assert_eq!(enter("1. a|\n- b\n2. c"), "1. a\n2. |\n- b\n2. c");
+        // Numbers that don't count up one at a time were written that way on
+        // purpose: `1.` on every item, or a deliberate skip.
+        assert_eq!(enter("1. a|\n1. b\n1. c"), "1. a\n2. |\n1. b\n1. c");
+        assert_eq!(enter("1. a|\n2. b\n5. c"), "1. a\n2. |\n3. b\n5. c");
+    }
+
+    #[test]
+    fn ending_a_list_midway_starts_the_rest_from_1() {
+        // Enter twice splits the list, and the part below is a list of its own.
+        let once = enter("1. hej\n2. hopp|\n3. hejhej\n4. sista");
+        assert_eq!(once, "1. hej\n2. hopp\n3. |\n4. hejhej\n5. sista");
+        assert_eq!(enter(&once), "1. hej\n2. hopp\n|\n1. hejhej\n2. sista");
+        // But in a list already spaced out with blank lines, it's one item gone.
+        assert_eq!(enter("1. a\n\n2. |\n\n3. b"), "1. a\n\n|\n\n2. b");
+    }
+
+    #[test]
+    fn climbing_out_of_a_sub_list_renumbers_both_lists() {
+        // Climbing out of a sub-list makes room in the parent's list, and the
+        // sub-items left below now start a sub-list of their own.
+        assert_eq!(
+            enter("1. a\n   1. x\n   2. |\n   3. y\n2. b"),
+            "1. a\n   1. x\n2. |\n   1. y\n3. b"
+        );
     }
 
     #[test]

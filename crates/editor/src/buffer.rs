@@ -172,6 +172,20 @@ impl Buffer {
         cursor_before: usize,
         coalesce: Option<u8>,
     ) -> usize {
+        self.replace_caret(range, text, text.len(), cursor_before, coalesce)
+    }
+
+    /// [`replace`](Self::replace), with the caret landing `caret` bytes into
+    /// `text` rather than after all of it — for an edit that also rewrites text
+    /// past where the caret belongs. Redo puts it back there too.
+    pub fn replace_caret(
+        &mut self,
+        range: Range<usize>,
+        text: &str,
+        caret: usize,
+        cursor_before: usize,
+        coalesce: Option<u8>,
+    ) -> usize {
         let start = self.clamp_boundary(range.start);
         let mut end = self.clamp_boundary(range.end);
         if end < start {
@@ -191,7 +205,7 @@ impl Buffer {
 
         self.apply(start, end, text);
 
-        let cursor_after = start + text.len();
+        let cursor_after = start + caret.min(text.len());
 
         let delta = Delta {
             start,
@@ -478,6 +492,20 @@ mod tests {
         let c = b.redo().unwrap();
         assert_eq!(b.text(), "hello world");
         assert_eq!(c, 11); // cursor_after
+    }
+
+    #[test]
+    fn replace_caret_lands_mid_insert_and_redo_returns_there() {
+        let mut b = Buffer::new("1. a\n2. b");
+        // Insert a new item after `a` and renumber `b` in the same edit; the
+        // caret belongs after the new marker, not after the `3`.
+        let c = b.replace_caret(4..6, "\n2. \n3", 4, 4, None);
+        assert_eq!(b.text(), "1. a\n2. \n3. b");
+        assert_eq!(c, 8);
+        assert_eq!(b.undo().unwrap(), 4);
+        assert_eq!(b.text(), "1. a\n2. b");
+        assert_eq!(b.redo().unwrap(), 8);
+        assert_eq!(b.text(), "1. a\n2. \n3. b");
     }
 
     #[test]
