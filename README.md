@@ -20,7 +20,7 @@ cursor (or selection) touches reveals its raw source.
 
 ```
 slimnotes/
-├── flake.nix              # Nix dev shell (Rust + Vulkan/Wayland/X11 libs)
+├── flake.nix              # Nix package + dev shell (Rust + Vulkan/Wayland/X11 libs)
 ├── Cargo.toml             # workspace
 └── crates/
     ├── vault/             # the vault model + all filesystem access:
@@ -156,3 +156,24 @@ cargo run -p slimnotes            # or: cargo run -p slimnotes --release
 
 On first run, pick a vault with the folder button in the sidebar; the choice is
 saved to `~/.config/slimnotes/settings.json`.
+
+### Installing from the flake
+
+`packages.default` builds the `slimnotes` binary with the GPUI runtime
+libraries on its RPATH, so it runs without the dev shell:
+
+```sh
+nix run github:fredr/slimnotes
+```
+
+Or add it as an input to a NixOS / home-manager flake:
+
+```nix
+inputs.slimnotes = {
+  url = "github:fredr/slimnotes";
+  inputs.nixpkgs.follows = "nixpkgs";
+};
+
+# then, e.g. in home-manager:
+home.packages = [ inputs.slimnotes.packages.${pkgs.stdenv.hostPlatform.system}.default ];
+```

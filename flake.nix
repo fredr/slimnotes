@@ -11,11 +11,13 @@
   };
 
   outputs = { self, nixpkgs, flake-utils, rust-overlay }:
-    flake-utils.lib.eachDefaultSystem (system:
+    # The GPUI stack below is the Linux one (Blade/Vulkan, Wayland, X11).
+    flake-utils.lib.eachSystem [ "x86_64-linux" "aarch64-linux" ] (system:
       let
         overlays = [ (import rust-overlay) ];
         pkgs = import nixpkgs { inherit system overlays; };
         rust = pkgs.rust-bin.stable.latest.default;
+        version = (pkgs.lib.importTOML ./Cargo.toml).workspace.package.version;
 
         # GPUI / Blade (Vulkan) runtime + link libraries on Linux. These mirror
         # the buildInputs nixpkgs uses for the Zed editor, which is built on the
@@ -35,6 +37,36 @@
         ];
       in
       {
+        # Built with nixpkgs' own Rust (not the overlay toolchain), so a
+        # consumer that sets `inputs.nixpkgs.follows` gets cached compilers.
+        packages.default = pkgs.rustPlatform.buildRustPackage {
+          pname = "slimnotes";
+          inherit version;
+          # Only what cargo needs, so the sample vault or a local target/ never
+          # reach the store.
+          src = pkgs.lib.fileset.toSource {
+            root = ./.;
+            fileset = pkgs.lib.fileset.unions [ ./Cargo.toml ./Cargo.lock ./crates ];
+          };
+          cargoLock.lockFile = ./Cargo.lock;
+
+          nativeBuildInputs = with pkgs; [ pkg-config cmake rustPlatform.bindgenHook ];
+          buildInputs = libraries;
+
+          # Vulkan and Wayland are dlopen'd at runtime rather than linked, so
+          # they have to be put on the RPATH by hand (as nixpkgs does for Zed).
+          postFixup = ''
+            patchelf --add-rpath ${pkgs.lib.makeLibraryPath libraries} $out/bin/slimnotes
+          '';
+
+          meta = {
+            description = "A minimal, Obsidian-vault-compatible notes app";
+            license = pkgs.lib.licenses.mit;
+            mainProgram = "slimnotes";
+            platforms = pkgs.lib.platforms.linux;
+          };
+        };
+
         devShells.default = pkgs.mkShell {
           nativeBuildInputs = with pkgs; [ rust pkg-config cmake ];
           buildInputs = libraries;
